@@ -94,11 +94,16 @@ where
     T: SizedSample,
     f32: FromSample<T>,
 {
+    let channels = config.channels as usize;
     device.build_input_stream(
         config,
         move |data: &[T], _| {
-            for &s in data {
-                let _ = producer.push(s.to_sample::<f32>());
+            // Downmix interleaved multi-channel input to mono before pushing.
+            // On stereo loopback this prevents L,R,L,R,... from corrupting the FFT.
+            let ch = channels.max(1);
+            for frame in data.chunks(ch) {
+                let mono = frame.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>() / ch as f32;
+                let _ = producer.push(mono);
             }
         },
         |err| eprintln!("audio stream error: {err}"),
