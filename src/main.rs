@@ -1,16 +1,27 @@
 use nannou::image::{DynamicImage, ImageBuffer, Rgba};
 use nannou::prelude::*;
+use icarus::analysis::{CQT_BINS, CQT_HISTORY, FFT_DISPLAY_BINS, FFT_HISTORY};
+use icarus::audio::{AudioCapture, FFT_SIZE};
+use icarus::midi_layer::MidiLayer;
+use icarus::transcription::{StreamingTranscriber, TRANSCRIPTION_HOP_SIZE};
 use std::collections::VecDeque;
 
-mod analysis;
-mod audio;
-mod midi_layer;
-mod objects;
-mod transcription;
-use analysis::{CQT_BINS, CQT_HISTORY, FFT_DISPLAY_BINS, FFT_HISTORY};
-use audio::{AudioCapture, FFT_SIZE};
-use midi_layer::MidiLayer;
-use transcription::{StreamingTranscriber, TRANSCRIPTION_HOP_SIZE};
+const MENU_BAR_H: f32 = 56.0;
+const MENU_ITEM_GAP: f32 = 28.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerKind {
+    Analysis,
+    Harmonics,
+    Percussion,
+}
+
+struct LayerMenuItem {
+    layers: Vec<LayerKind>,
+    label: &'static str,
+    active: bool,
+    hue: f32,
+}
 
 struct Model {
     audio: AudioCapture,
@@ -29,6 +40,8 @@ struct Model {
     snare_flash: f32,
     hihat_flash: f32,
     midi: MidiLayer,
+    layer_menu: Vec<LayerMenuItem>,
+    selected_group: usize,
 }
 
 fn main() {
@@ -39,6 +52,7 @@ fn model(app: &App) -> Model {
     app.new_window()
         .title("Icarus")
         .size(1280, 720)
+        .key_pressed(key_pressed)
         .view(view)
         .build()
         .unwrap();
@@ -79,6 +93,49 @@ fn model(app: &App) -> Model {
         snare_flash: 0.0,
         hihat_flash: 0.0,
         midi: MidiLayer::new(sample_rate),
+        layer_menu: vec![
+            LayerMenuItem {
+                layers: vec![LayerKind::Analysis],
+                label: "Analysis",
+                active: true,
+                hue: 0.15,
+            },
+            LayerMenuItem {
+                layers: vec![LayerKind::Harmonics],
+                label: "Harmonics",
+                active: true,
+                hue: 0.34,
+            },
+            LayerMenuItem {
+                layers: vec![LayerKind::Percussion],
+                label: "Percussion",
+                active: true,
+                hue: 0.60,
+            },
+        ],
+        selected_group: 0,
+    }
+}
+
+fn key_pressed(_app: &App, model: &mut Model, key: Key) {
+    if model.layer_menu.is_empty() {
+        return;
+    }
+
+    match key {
+        Key::Left => {
+            model.selected_group =
+                (model.selected_group + model.layer_menu.len() - 1) % model.layer_menu.len();
+        }
+        Key::Right => {
+            model.selected_group = (model.selected_group + 1) % model.layer_menu.len();
+        }
+        Key::Space => {
+            if let Some(item) = model.layer_menu.get_mut(model.selected_group) {
+                item.active = !item.active;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -156,6 +213,8 @@ fn spectrogram_rgba(mag: f32) -> [u8; 4] {
     if mag < 0.015 {
         return [0, 0, 0, 255];
     }
+    // Log scale: boost low magnitudes for visibility
+    let mag = (mag * 9.0 + 1.0).log10(); // [0,1] → [0,1] with log curve
     let hue = 0.75 - mag * 0.75;
     let lit = (mag * 0.6 + 0.05).clamp(0.0, 0.65);
     let [r, g, b] = hsl_to_rgb(hue, 1.0, lit);
@@ -182,10 +241,75 @@ fn view(app: &App, model: &Model, frame: Frame) {
     draw.background().color(BLACK);
 
     let win = app.window_rect();
-    let f = model.transcriber.features();
+    draw_menu_layer(&draw, win, model);
 
-    let spec_h = win.h() * 0.78;
+    for group in &model.layer_menu {
+        if !group.active {
+            continue;
+        }
+
+        for layer in &group.layers {
+            match layer {
+                LayerKind::Analysis => draw_analysis_layer(&draw, model, &frame, win),
+                LayerKind::Harmonics | LayerKind::Percussion => {}
+            }
+        }
+    }
+
+    draw.to_frame(app, &frame).unwrap();
+}
+
+fn draw_menu_layer(draw: &Draw, win: Rect, model: &Model) {
+    let bar_y = win.top() - MENU_BAR_H * 0.5;
+    draw.rect()
+        .x_y(0.0, bar_y)
+        .w_h(win.w(), MENU_BAR_H)
+        .color(rgba(0.02, 0.025, 0.035, 0.96));
+
+    let brand_x = win.left() + 74.0;
+    draw.text("ICARUS")
+        .x_y(brand_x, win.top() - 24.0)
+        .font_size(9)
+        .color(rgba(1.0, 1.0, 1.0, 0.82));
+
+    let mut cursor_x = brand_x + 92.0;
+    for (idx, item) in model.layer_menu.iter().enumerate() {
+        let estimated_w = item.label.len() as f32 * 7.2 + 18.0;
+        let item_x = cursor_x + estimated_w * 0.5;
+        let is_selected = idx == model.selected_group;
+        let text_alpha = if is_selected { 0.98 } else { 0.68 };
+        let indicator_y = win.top() - MENU_BAR_H + 10.0;
+        let indicator_h = 8.0;
+
+        draw.text(item.label)
+            .x_y(item_x, win.top() - 24.0)
+            .font_size(9)
+            .color(rgba(1.0, 1.0, 1.0, text_alpha));
+
+        if item.active {
+            draw.rect()
+                .x_y(item_x, indicator_y)
+                .w_h(estimated_w, indicator_h)
+                .color(hsla(item.hue, 0.78, 0.54, 0.82));
+
+            if is_selected {
+                draw.line()
+                    .start(pt2(item_x - estimated_w * 0.5, indicator_y - indicator_h * 0.5))
+                    .end(pt2(item_x + estimated_w * 0.5, indicator_y - indicator_h * 0.5))
+                    .color(rgba(1.0, 1.0, 1.0, 0.95))
+                    .weight(2.0);
+            }
+        }
+
+        cursor_x += estimated_w + MENU_ITEM_GAP;
+    }
+}
+
+fn draw_analysis_layer(draw: &Draw, model: &Model, frame: &Frame, win: Rect) {
+    let f = model.transcriber.features();
+    let content_top = win.top() - MENU_BAR_H - 10.0;
     let spec_bottom = win.bottom() + win.h() * 0.18;
+    let spec_h = (content_top - spec_bottom).max(80.0);
 
     // ── CQT spectrogram texture (pitch-aligned with the piano roll) ──────
     frame.device_queue_pair().queue().write_texture(
@@ -322,11 +446,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
             .end(pt2(note_x0 + note_w, panel_y1))
             .color(rgba(1.0, 1.0, 1.0, 0.35))
             .weight(1.5);
-
-        draw.text("MIDI")
-            .x_y(panel_x0 + label_w * 0.45, panel_y1 - 10.0)
-            .font_size(11)
-            .color(rgba(1.0, 1.0, 1.0, 0.60));
     }
 
     // ── 6 band energy bars ────────────────────────────────────────────────
@@ -380,9 +499,8 @@ fn view(app: &App, model: &Model, frame: Frame) {
         ("HIHAT", f.hihat, f.hihat_strength, 0.60, model.hihat_flash),
     ];
     let ind_x0 = win.right() - 90.0;
-    let ind_y0 = win.top() - 28.0;
     for (j, &(label, beat, strength, hue, flash)) in ind_labels.iter().enumerate() {
-        let iy = ind_y0 - j as f32 * 26.0;
+        let iy = (content_top - 18.0) - j as f32 * 26.0;
         let lit = 0.18 + 0.57 * flash.max(if beat { 1.0 } else { 0.0 });
         draw.ellipse()
             .x_y(ind_x0, iy)
@@ -390,7 +508,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
             .color(hsl(hue, 1.0, lit));
         draw.text(label)
             .x_y(ind_x0 + 32.0, iy)
-            .font_size(10)
+            .font_size(9)
             .color(rgba(1.0_f32, 1.0, 1.0, if beat { 1.0 } else { 0.4 }));
         if strength > 0.0 {
             draw.text(&format!("{:.2}", strength))
@@ -437,7 +555,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
 
         draw.text(name)
             .x_y(cx, name_y)
-            .font_size(10)
+            .font_size(9)
             .color(rgba(1.0_f32, 1.0, 1.0, 0.7));
 
         if !lo.is_empty() {
@@ -454,7 +572,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
         }
     }
 
-    draw.to_frame(app, &frame).unwrap();
 }
 
 fn midi_pitch_y(midi_note: u8, note_min: u8, note_max: u8, panel_y0: f32, panel_y1: f32) -> f32 {

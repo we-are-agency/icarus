@@ -6,6 +6,7 @@ use crate::analysis::{
 use crate::audio::FFT_SIZE;
 use crate::objects::{SoundKind, SoundObject, SoundObjectDetector};
 use midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
+use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -50,6 +51,22 @@ const HARMONIC_START_THRESHOLD: f32 = 0.10;
 const HARMONIC_STOP_THRESHOLD: f32 = 0.04;
 const HARMONIC_MIN_NOTE_SECS: f32 = 0.05;
 const HARMONIC_RETRIGGER_GAP_SECS: f32 = 0.10;
+const HARMONIC_PITCH_LOCK_SECS: f32 = 0.036;
+const HARMONIC_LOCKED_MATCH_DISTANCE: i16 = 0;
+const HARMONIC_PENDING_CONFIRM_HITS: u8 = 2;
+const HARMONIC_PENDING_MAX_AGE_SECS: f32 = 0.060;
+const HARMONIC_PENDING_MAX_GAP_SECS: f32 = 0.045;
+const HARMONIC_IMMEDIATE_ONSET_CONFIDENCE: f32 = 0.12;
+const HARMONIC_STRONG_SUSTAIN_CONFIDENCE: f32 = 0.28;
+const HARMONIC_LOCAL_CONTRAST_MIN: f32 = 0.010;
+const HARMONIC_IMMEDIATE_CONTRAST_MIN: f32 = 0.018;
+const HARMONIC_REFERENCE_DECAY: f32 = 0.95;
+const HARMONIC_TOTAL_REFERENCE_DECAY: f32 = 0.96;
+const NORMALIZATION_COLLAPSE_PEAK_RATIO: f32 = 0.58;
+const NORMALIZATION_COLLAPSE_TOTAL_RATIO: f32 = 0.52;
+const NORMALIZATION_COLLAPSE_GUARD_DECAY: f32 = 0.68;
+const NORMALIZATION_COLLAPSE_FANOUT_START: f32 = 0.34;
+const NORMALIZATION_COLLAPSE_STRONG_ONSET: f32 = 0.28;
 const DRUM_NOTE_LENGTH_SECS: f32 = 0.09;
 const DRUM_COOLDOWN_SECS: f32 = 0.05;
 const DRUM_KICK_NOTE: u8 = 36;
@@ -87,7 +104,7 @@ pub struct WavClip {
     pub samples: Vec<f32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct GroundTruthNote {
     pub source_id: usize,
     pub midi_note: u8,
@@ -103,7 +120,7 @@ pub struct LoadedPair {
     pub max_polyphony: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TranscribedNote {
     pub stream_id: usize,
     pub midi_note: u8,
@@ -112,13 +129,13 @@ pub struct TranscribedNote {
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CompletedTranscribedNote {
     pub id: usize,
     pub note: TranscribedNote,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ActiveTranscribedNote {
     pub id: usize,
     pub stream_id: usize,
@@ -128,7 +145,167 @@ pub struct ActiveTranscribedNote {
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureBucket {
+    Correct,
+    MissedNote,
+    ExtraNote,
+    MergeLikely,
+    SplitLikely,
+    OctaveError,
+    PitchError,
+    EarlyOnset,
+    LateOnset,
+    EarlyRelease,
+    LateRelease,
+    TimingDrift,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticEvent {
+    pub bucket: FailureBucket,
+    pub source_id: Option<usize>,
+    pub stream_id: Option<usize>,
+    pub matched: bool,
+    pub similarity: f32,
+    pub pitch_error_semitones: Option<f32>,
+    pub start_error_ms: Option<f32>,
+    pub end_error_ms: Option<f32>,
+    pub predicted: Option<TranscribedNote>,
+    pub reference: Option<GroundTruthNote>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BucketCount {
+    pub bucket: FailureBucket,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ErrorStats {
+    pub count: usize,
+    pub mean: f32,
+    pub p50: f32,
+    pub p90: f32,
+    pub max: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ErrorSummary {
+    pub pitch_error_semitones: ErrorStats,
+    pub start_error_ms: ErrorStats,
+    pub end_error_ms: ErrorStats,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteDiagnostics {
+    pub metrics: NoteMetrics,
+    pub bucket_counts: Vec<BucketCount>,
+    pub error_summary: ErrorSummary,
+    pub events: Vec<DiagnosticEvent>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationCaseKind {
+    SingleSource,
+    Mix2Source,
+    Mix3Source,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDiagnostic {
+    pub source_id: usize,
+    pub label: String,
+    pub stream_id: Option<usize>,
+    pub diagnostics: NoteDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamDiagnostic {
+    pub stream_id: usize,
+    pub diagnostics: NoteDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvaluationCaseReport {
+    pub label: String,
+    pub kind: EvaluationCaseKind,
+    pub source_count: usize,
+    pub sample_rate: u32,
+    pub tags: Vec<String>,
+    pub diagnostics: NoteDiagnostics,
+    pub per_source: Vec<SourceDiagnostic>,
+    pub unassigned_streams: Vec<StreamDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceSeparatedDiagnostics {
+    pub diagnostics: NoteDiagnostics,
+    pub per_source: Vec<SourceDiagnostic>,
+    pub unassigned_streams: Vec<StreamDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvaluationSliceReport {
+    pub label: String,
+    pub case_count: usize,
+    pub diagnostics: NoteDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvaluationSuiteReport {
+    pub dataset_dir: String,
+    pub overall: EvaluationSliceReport,
+    pub slices: Vec<EvaluationSliceReport>,
+    pub cases: Vec<EvaluationCaseReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteMetricSummary {
+    pub score_percent: f32,
+    pub predicted_notes: usize,
+    pub reference_notes: usize,
+    pub matched_pairs: usize,
+    pub matched_onsets: usize,
+    pub matched_notes: usize,
+    pub mean_pitch_error_cents: f32,
+    pub mean_start_error_ms: f32,
+    pub mean_end_error_ms: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticSummary {
+    pub metrics: NoteMetricSummary,
+    pub bucket_counts: Vec<BucketCount>,
+    pub error_summary: ErrorSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvaluationCaseSummary {
+    pub label: String,
+    pub kind: EvaluationCaseKind,
+    pub source_count: usize,
+    pub diagnostics: DiagnosticSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvaluationSliceSummary {
+    pub label: String,
+    pub case_count: usize,
+    pub diagnostics: DiagnosticSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvaluationSuiteSummary {
+    pub dataset_dir: String,
+    pub overall: EvaluationSliceSummary,
+    pub slices: Vec<EvaluationSliceSummary>,
+    pub cases: Vec<EvaluationCaseSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct NoteMetrics {
     pub predicted_notes: usize,
     pub reference_notes: usize,
@@ -194,14 +371,14 @@ impl NoteMetrics {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SourceEval {
     pub source_id: usize,
     pub stream_id: Option<usize>,
     pub metrics: NoteMetrics,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct EvalSummary {
     pub per_source: Vec<SourceEval>,
     pub total: NoteMetrics,
@@ -258,7 +435,43 @@ struct StreamState {
 struct NoteActivation {
     midi_note: u8,
     salience: f32,
+    absolute_strength: f32,
     brightness: f32,
+    local_contrast: f32,
+    register: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NoteEvidenceFrame {
+    salience: [f32; 128],
+    absolute_strength: [f32; 128],
+}
+
+#[derive(Debug, Clone)]
+struct PendingHarmonicCandidate {
+    midi_note: u8,
+    first_seen_secs: f32,
+    last_seen_secs: f32,
+    best_salience: f32,
+    best_absolute_strength: f32,
+    brightness: f32,
+    local_contrast: f32,
+    consecutive_hits: u8,
+    register: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SalienceFrameStats {
+    global_peak: f32,
+    total_energy: f32,
+    register_peaks: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BirthDecision {
+    Reject,
+    Pending,
+    Immediate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +499,12 @@ struct RealtimeTranscriber {
     elapsed_secs: f32,
     note_energy_ema: [f32; 128],
     note_cooldown_secs: [f32; 128],
+    peak_salience_ref: f32,
+    total_salience_ref: f32,
+    register_peak_refs: [f32; 3],
+    collapse_guard: f32,
     active_notes: Vec<RealtimeActiveNote>,
+    pending_candidates: Vec<PendingHarmonicCandidate>,
     finished_notes: Vec<CompletedTranscribedNote>,
     streams: HashMap<usize, StreamState>,
     next_stream_id: usize,
@@ -642,7 +860,12 @@ impl RealtimeTranscriber {
             elapsed_secs: 0.0,
             note_energy_ema: [0.0; 128],
             note_cooldown_secs: [0.0; 128],
+            peak_salience_ref: 0.0,
+            total_salience_ref: 0.0,
+            register_peak_refs: [0.0; 3],
+            collapse_guard: 0.0,
             active_notes: Vec::new(),
+            pending_candidates: Vec::new(),
             finished_notes: Vec::new(),
             streams: HashMap::new(),
             next_stream_id: 0,
@@ -720,11 +943,17 @@ impl RealtimeTranscriber {
             *cooldown = (*cooldown - dt).max(0.0);
         }
 
-        let salience = note_salience(&self.analyser.features.cqt);
-        self.update_note_energy_ema(&salience);
+        let note_evidence = note_evidence(&self.analyser.features.cqt);
+        let frame_stats = evidence_frame_stats(&note_evidence.absolute_strength);
+        self.collapse_guard = self.compute_collapse_guard(frame_stats);
+        self.update_note_energy_ema(&note_evidence.absolute_strength);
         let candidates = select_note_activations(
-            &salience,
+            &note_evidence.salience,
+            &note_evidence.absolute_strength,
             &self.note_energy_ema,
+            self.peak_salience_ref,
+            &self.register_peak_refs,
+            self.collapse_guard,
             harmonic_confidence,
             pitched_stability,
             self.max_streams,
@@ -732,12 +961,13 @@ impl RealtimeTranscriber {
         self.update_harmonic_notes(&candidates, frame_start, frame_end);
         self.emit_percussive_notes(frame_start);
         self.release_stale_notes(frame_end);
+        self.update_salience_references(frame_stats);
     }
 
-    fn update_note_energy_ema(&mut self, salience: &[f32; 128]) {
+    fn update_note_energy_ema(&mut self, note_strength: &[f32; 128]) {
         for midi_note in TRANSCRIPTION_MIDI_LOW..=TRANSCRIPTION_MIDI_HIGH {
             let idx = midi_note as usize;
-            let target = salience[idx];
+            let target = note_strength[idx];
             let current = self.note_energy_ema[idx];
             let alpha = if target >= current { 0.35 } else { 0.12 };
             self.note_energy_ema[idx] = current + alpha * (target - current);
@@ -753,15 +983,24 @@ impl RealtimeTranscriber {
         let onset_confidence = self.analyser.features.onset_confidence;
         let mut matched_ids = HashSet::new();
         let mut restarts = Vec::new();
+        let mut pending_candidates = Vec::new();
+        let (immediate_budget, pending_budget) = self.collapse_birth_budgets();
+        let mut immediate_births = 0usize;
+        let mut deferred_births = 0usize;
 
         for candidate in candidates {
-            if let Some(active_idx) = self.find_best_harmonic_match(candidate, &matched_ids) {
+            if let Some(active_idx) =
+                self.find_best_harmonic_match(candidate, &matched_ids, frame_start)
+            {
                 let active = &self.active_notes[active_idx];
-                let should_retrigger = onset_confidence >= NOTE_RETRIGGER_ONSET_CONFIDENCE
-                    && frame_start - active.start_secs >= HARMONIC_RETRIGGER_GAP_SECS
+                let active_age = frame_start - active.start_secs;
+                let pitch_locked = active_age >= HARMONIC_PITCH_LOCK_SECS;
+                let should_retrigger = onset_confidence >= NOTE_RETRIGGER_ONSET_CONFIDENCE + 0.08
+                    && frame_start - active.start_secs >= HARMONIC_RETRIGGER_GAP_SECS + 0.04
                     && semitone_distance(active.midi_note, candidate.midi_note)
                         <= NOTE_RELOCK_DISTANCE
-                    && candidate.salience >= active.confidence * 0.92;
+                    && candidate.salience >= active.confidence * 1.08
+                    && candidate.local_contrast >= HARMONIC_IMMEDIATE_CONTRAST_MIN;
                 if should_retrigger {
                     let stream_id = active.stream_id;
                     self.finish_realtime_note(active_idx, frame_start);
@@ -773,8 +1012,10 @@ impl RealtimeTranscriber {
                 active.last_seen_secs = frame_end;
                 active.confidence = 0.7 * active.confidence + 0.3 * candidate.salience;
                 active.brightness = 0.8 * active.brightness + 0.2 * candidate.brightness;
-                if semitone_distance(active.midi_note, candidate.midi_note) <= NOTE_RELOCK_DISTANCE
-                    && candidate.salience >= active.confidence * 0.75
+                if !pitch_locked
+                    && semitone_distance(active.midi_note, candidate.midi_note)
+                        <= NOTE_RELOCK_DISTANCE
+                    && candidate.salience >= active.confidence * 0.82
                 {
                     active.midi_note = candidate.midi_note;
                 }
@@ -782,17 +1023,34 @@ impl RealtimeTranscriber {
                 continue;
             }
 
-            if self.should_start_harmonic_note(candidate) {
-                self.start_harmonic_note(*candidate, frame_start, None);
+            match self.limit_birth_fanout(
+                candidate,
+                self.classify_harmonic_birth(candidate),
+                immediate_births,
+                deferred_births,
+                immediate_budget,
+                pending_budget,
+            ) {
+                BirthDecision::Immediate => {
+                    self.start_harmonic_note(*candidate, frame_start, None);
+                    immediate_births += 1;
+                }
+                BirthDecision::Pending => {
+                    pending_candidates.push(*candidate);
+                    deferred_births += 1;
+                }
+                BirthDecision::Reject => {}
             }
         }
 
         for (candidate, stream_id) in restarts {
             self.start_harmonic_note(candidate, frame_start, Some(stream_id));
         }
+
+        self.update_pending_harmonic_candidates(&pending_candidates, frame_start, frame_end);
     }
 
-    fn should_start_harmonic_note(&self, candidate: &NoteActivation) -> bool {
+    fn classify_harmonic_birth(&self, candidate: &NoteActivation) -> BirthDecision {
         let idx = candidate.midi_note as usize;
         let features = &self.analyser.features;
         let already_active = self
@@ -800,15 +1058,250 @@ impl RealtimeTranscriber {
             .iter()
             .any(|note| note.kind == ActiveKind::Harmonic && note.midi_note == candidate.midi_note);
         if already_active || self.note_cooldown_secs[idx] > 0.0 {
-            return false;
+            return BirthDecision::Reject;
         }
 
-        let activation = self.note_energy_ema[idx];
-        let onset_ok = features.onset_confidence >= 0.10;
+        let floor = self.harmonic_birth_floor(candidate);
+        let collapse_penalty = self.collapse_birth_penalty(candidate);
+        let immediate_floor = floor * (0.92 + 0.08 * collapse_penalty);
+        let pending_floor = floor * (0.66 + 0.06 * collapse_penalty);
+        let onset_ok = features.onset_confidence >= HARMONIC_IMMEDIATE_ONSET_CONFIDENCE;
         let sustained_ok =
-            features.harmonic_confidence >= 0.20 || features.pitched_stability >= 0.22;
-        candidate.salience >= HARMONIC_START_THRESHOLD.max(activation * 0.95)
+            features.harmonic_confidence >= HARMONIC_STRONG_SUSTAIN_CONFIDENCE
+                || features.pitched_stability >= HARMONIC_STRONG_SUSTAIN_CONFIDENCE;
+        let moderate_support =
+            features.onset_confidence >= 0.06 || features.harmonic_confidence >= 0.20
+                || features.pitched_stability >= 0.20;
+
+        if candidate.absolute_strength >= immediate_floor
+            && candidate.local_contrast >= HARMONIC_IMMEDIATE_CONTRAST_MIN
             && (onset_ok || sustained_ok)
+        {
+            return BirthDecision::Immediate;
+        }
+
+        if candidate.absolute_strength >= pending_floor
+            && candidate.local_contrast >= HARMONIC_LOCAL_CONTRAST_MIN
+            && moderate_support
+        {
+            return BirthDecision::Pending;
+        }
+
+        BirthDecision::Reject
+    }
+
+    fn harmonic_birth_floor(&self, candidate: &NoteActivation) -> f32 {
+        let idx = candidate.midi_note as usize;
+        let global_ref = self.peak_salience_ref * 0.12;
+        let register_ref = self.register_peak_refs[candidate.register] * 0.24;
+        let note_ref = self.note_energy_ema[idx] * 0.98;
+        let total_ref = (self.total_salience_ref / 12.0) * 0.03;
+        HARMONIC_START_THRESHOLD
+            .max(global_ref)
+            .max(register_ref)
+            .max(note_ref)
+            .max(total_ref)
+    }
+
+    fn collapse_birth_penalty(&self, candidate: &NoteActivation) -> f32 {
+        let register_weight = match candidate.register {
+            0 => 0.15,
+            1 => 0.45,
+            _ => 1.0,
+        };
+        self.collapse_guard * register_weight
+    }
+
+    fn collapse_birth_budgets(&self) -> (usize, usize) {
+        if self.collapse_guard < NORMALIZATION_COLLAPSE_FANOUT_START {
+            return (usize::MAX, usize::MAX);
+        }
+
+        let onset_confidence = self.analyser.features.onset_confidence;
+        if onset_confidence >= NORMALIZATION_COLLAPSE_STRONG_ONSET {
+            (3, 3)
+        } else if onset_confidence >= NOTE_RETRIGGER_ONSET_CONFIDENCE {
+            (2, 2)
+        } else {
+            (1, 1)
+        }
+    }
+
+    fn collapse_birth_override_strength(&self, candidate: &NoteActivation) -> bool {
+        if self.collapse_guard < NORMALIZATION_COLLAPSE_FANOUT_START {
+            return true;
+        }
+
+        let floor = self.harmonic_birth_floor(candidate);
+        let collapse_penalty = self.collapse_birth_penalty(candidate);
+        let onset_confidence = self.analyser.features.onset_confidence;
+        candidate.absolute_strength >= floor * (1.45 + 0.20 * collapse_penalty)
+            && candidate.local_contrast
+                >= HARMONIC_IMMEDIATE_CONTRAST_MIN * (1.6 + 0.25 * collapse_penalty)
+            && onset_confidence >= HARMONIC_IMMEDIATE_ONSET_CONFIDENCE
+    }
+
+    fn limit_birth_fanout(
+        &self,
+        candidate: &NoteActivation,
+        decision: BirthDecision,
+        immediate_births: usize,
+        deferred_births: usize,
+        immediate_budget: usize,
+        pending_budget: usize,
+    ) -> BirthDecision {
+        if self.collapse_guard < NORMALIZATION_COLLAPSE_FANOUT_START
+            || self.collapse_birth_override_strength(candidate)
+        {
+            return decision;
+        }
+
+        match decision {
+            BirthDecision::Immediate => {
+                if immediate_births < immediate_budget {
+                    BirthDecision::Immediate
+                } else if deferred_births < pending_budget {
+                    BirthDecision::Pending
+                } else {
+                    BirthDecision::Reject
+                }
+            }
+            BirthDecision::Pending => {
+                if deferred_births < pending_budget {
+                    BirthDecision::Pending
+                } else {
+                    BirthDecision::Reject
+                }
+            }
+            BirthDecision::Reject => BirthDecision::Reject,
+        }
+    }
+
+    fn update_pending_harmonic_candidates(
+        &mut self,
+        candidates: &[NoteActivation],
+        frame_start: f32,
+        frame_end: f32,
+    ) {
+        for candidate in candidates {
+            let Some((_, pending)) = self
+                .pending_candidates
+                .iter_mut()
+                .enumerate()
+                .find(|(_, pending)| {
+                    semitone_distance(pending.midi_note, candidate.midi_note)
+                        <= NOTE_RELOCK_DISTANCE
+                })
+            else {
+                self.pending_candidates.push(PendingHarmonicCandidate {
+                    midi_note: candidate.midi_note,
+                    first_seen_secs: frame_start,
+                    last_seen_secs: frame_end,
+                    best_salience: candidate.salience,
+                    best_absolute_strength: candidate.absolute_strength,
+                    brightness: candidate.brightness,
+                    local_contrast: candidate.local_contrast,
+                    consecutive_hits: 1,
+                    register: candidate.register,
+                });
+                continue;
+            };
+
+            pending.midi_note = candidate.midi_note;
+            pending.last_seen_secs = frame_end;
+            pending.best_salience = pending.best_salience.max(candidate.salience);
+            pending.best_absolute_strength = pending
+                .best_absolute_strength
+                .max(candidate.absolute_strength);
+            pending.brightness = 0.75 * pending.brightness + 0.25 * candidate.brightness;
+            pending.local_contrast = pending.local_contrast.max(candidate.local_contrast);
+            pending.consecutive_hits = pending.consecutive_hits.saturating_add(1);
+        }
+
+        for idx in (0..self.pending_candidates.len()).rev() {
+            let pending = &self.pending_candidates[idx];
+            let age_secs = frame_end - pending.first_seen_secs;
+            let gap_secs = frame_end - pending.last_seen_secs;
+            let candidate = NoteActivation {
+                midi_note: pending.midi_note,
+                salience: pending.best_salience,
+                absolute_strength: pending.best_absolute_strength,
+                brightness: pending.brightness,
+                local_contrast: pending.local_contrast,
+                register: pending.register,
+            };
+            let commit_floor = self.harmonic_birth_floor(&candidate)
+                * (0.72 + 0.05 * self.collapse_birth_penalty(&candidate));
+            let should_commit = pending.consecutive_hits >= HARMONIC_PENDING_CONFIRM_HITS
+                && pending.best_absolute_strength >= commit_floor
+                && pending.local_contrast >= HARMONIC_LOCAL_CONTRAST_MIN;
+            let should_drop = gap_secs > HARMONIC_PENDING_MAX_GAP_SECS
+                || age_secs > HARMONIC_PENDING_MAX_AGE_SECS;
+
+            if should_commit {
+                let pending = self.pending_candidates.remove(idx);
+                let committed = NoteActivation {
+                    midi_note: pending.midi_note,
+                    salience: pending.best_salience,
+                    absolute_strength: pending.best_absolute_strength,
+                    brightness: pending.brightness,
+                    local_contrast: pending.local_contrast,
+                    register: pending.register,
+                };
+                if !self.active_notes.iter().any(|note| {
+                    note.kind == ActiveKind::Harmonic
+                        && semitone_distance(note.midi_note, committed.midi_note)
+                            <= NOTE_RELOCK_DISTANCE
+                }) {
+                    self.start_harmonic_note(committed, pending.first_seen_secs, None);
+                }
+                continue;
+            }
+
+            if should_drop {
+                self.pending_candidates.remove(idx);
+            }
+        }
+    }
+
+    fn compute_collapse_guard(&self, stats: SalienceFrameStats) -> f32 {
+        let peak_ratio = if self.peak_salience_ref > 1e-4 {
+            stats.global_peak / self.peak_salience_ref
+        } else {
+            1.0
+        };
+        let total_ratio = if self.total_salience_ref > 1e-3 {
+            stats.total_energy / self.total_salience_ref
+        } else {
+            1.0
+        };
+        let peak_collapse =
+            ((NORMALIZATION_COLLAPSE_PEAK_RATIO - peak_ratio) / NORMALIZATION_COLLAPSE_PEAK_RATIO)
+                .max(0.0);
+        let total_collapse = ((NORMALIZATION_COLLAPSE_TOTAL_RATIO - total_ratio)
+            / NORMALIZATION_COLLAPSE_TOTAL_RATIO)
+            .max(0.0);
+        let combined_collapse = (0.6 * peak_collapse + 0.4 * total_collapse).clamp(0.0, 1.0);
+        (self.collapse_guard * NORMALIZATION_COLLAPSE_GUARD_DECAY)
+            .max(combined_collapse)
+            .clamp(0.0, 1.0)
+    }
+
+    fn update_salience_references(&mut self, stats: SalienceFrameStats) {
+        self.peak_salience_ref =
+            update_reference_envelope(self.peak_salience_ref, stats.global_peak, HARMONIC_REFERENCE_DECAY);
+        self.total_salience_ref = update_reference_envelope(
+            self.total_salience_ref,
+            stats.total_energy,
+            HARMONIC_TOTAL_REFERENCE_DECAY,
+        );
+        for register in 0..self.register_peak_refs.len() {
+            self.register_peak_refs[register] = update_reference_envelope(
+                self.register_peak_refs[register],
+                stats.register_peaks[register],
+                HARMONIC_REFERENCE_DECAY,
+            );
+        }
     }
 
     fn start_harmonic_note(
@@ -829,6 +1322,9 @@ impl RealtimeTranscriber {
             brightness: candidate.brightness,
             kind: ActiveKind::Harmonic,
         });
+        self.pending_candidates.retain(|pending| {
+            semitone_distance(pending.midi_note, candidate.midi_note) > NOTE_RELOCK_DISTANCE
+        });
         self.next_note_id += 1;
         self.note_cooldown_secs[candidate.midi_note as usize] = HARMONIC_MIN_NOTE_SECS;
         self.update_stream(stream_id, candidate.midi_note, candidate.brightness);
@@ -846,30 +1342,44 @@ impl RealtimeTranscriber {
         let is_onset = self.analyser.features.is_onset;
         let percussive_confidence = self.analyser.features.percussive_confidence;
 
-        let onset_like = is_onset || kick || snare || hihat || onset_confidence >= 0.24;
-        if !onset_like || percussive_confidence < 0.18 {
+        let onset_like = is_onset || kick || snare || hihat || onset_confidence >= 0.28;
+        if !onset_like || percussive_confidence < 0.22 {
+            return;
+        }
+        if self.collapse_guard >= 0.45 && onset_confidence < 0.45 && percussive_confidence < 0.55 {
             return;
         }
 
-        let mut emitted = false;
-        if (kick || kick_strength >= 0.10) && self.drum_cooldowns[0] <= 0.0 {
+        if (kick || kick_strength >= 0.12)
+            && percussive_confidence >= 0.24
+            && self.drum_cooldowns[0] <= 0.0
+        {
             self.push_drum_note(DRUM_KICK_NOTE, 0.18, start_secs, 0);
-            emitted = true;
         }
-        if (snare || snare_strength >= 0.10) && self.drum_cooldowns[1] <= 0.0 {
+        if (snare || snare_strength >= 0.12)
+            && percussive_confidence >= 0.24
+            && self.drum_cooldowns[1] <= 0.0
+        {
             self.push_drum_note(DRUM_SNARE_NOTE, 0.45, start_secs, 1);
-            emitted = true;
         }
-        if (hihat || hihat_strength >= 0.08 || brightness >= 0.62) && self.drum_cooldowns[2] <= 0.0
+        if (hihat || hihat_strength >= 0.10)
+            && brightness >= 0.45
+            && percussive_confidence >= 0.24
+            && self.drum_cooldowns[2] <= 0.0
         {
             self.push_drum_note(DRUM_HIHAT_NOTE, 0.82, start_secs, 2);
-            emitted = true;
         }
-
-        if !emitted {
-            let (note, brightness, class_idx) = if brightness < 0.30 {
+        if !kick
+            && !snare
+            && !hihat
+            && onset_confidence >= 0.52
+            && percussive_confidence >= 0.55
+        {
+            let (note, brightness, class_idx) = if kick_strength >= snare_strength
+                && kick_strength >= hihat_strength
+            {
                 (DRUM_KICK_NOTE, 0.18, 0)
-            } else if brightness < 0.62 {
+            } else if snare_strength >= hihat_strength {
                 (DRUM_SNARE_NOTE, 0.45, 1)
             } else {
                 (DRUM_HIHAT_NOTE, 0.82, 2)
@@ -910,7 +1420,9 @@ impl RealtimeTranscriber {
             }
             let activation = self.note_energy_ema[note.midi_note as usize];
             let stale = frame_end - note.last_seen_secs >= NOTE_RELEASE_HOLD_SECS;
-            if stale || activation < HARMONIC_STOP_THRESHOLD {
+            let weak_for_long = activation < HARMONIC_STOP_THRESHOLD
+                && frame_end - note.last_seen_secs >= NOTE_RELEASE_HOLD_SECS * 0.5;
+            if stale || weak_for_long {
                 self.finish_realtime_note(idx, frame_end);
             }
         }
@@ -932,6 +1444,7 @@ impl RealtimeTranscriber {
         &self,
         candidate: &NoteActivation,
         matched_ids: &HashSet<usize>,
+        frame_start: f32,
     ) -> Option<usize> {
         self.active_notes
             .iter()
@@ -940,7 +1453,12 @@ impl RealtimeTranscriber {
                 note.kind == ActiveKind::Harmonic && !matched_ids.contains(&note.id)
             })
             .filter(|(_, note)| {
-                semitone_distance(note.midi_note, candidate.midi_note) <= NOTE_SPLIT_DISTANCE
+                let max_distance = if frame_start - note.start_secs >= HARMONIC_PITCH_LOCK_SECS {
+                    HARMONIC_LOCKED_MATCH_DISTANCE
+                } else {
+                    NOTE_SPLIT_DISTANCE
+                };
+                semitone_distance(note.midi_note, candidate.midi_note) <= max_distance
             })
             .min_by(|a, b| {
                 harmonic_note_distance(a.1, candidate)
@@ -1232,6 +1750,13 @@ pub fn mix_clips(clips: &[WavClip]) -> Result<WavClip, Box<dyn Error>> {
 }
 
 pub fn evaluate_notes(predicted: &[TranscribedNote], reference: &[GroundTruthNote]) -> NoteMetrics {
+    evaluate_notes_detailed(predicted, reference).metrics
+}
+
+pub fn evaluate_notes_detailed(
+    predicted: &[TranscribedNote],
+    reference: &[GroundTruthNote],
+) -> NoteDiagnostics {
     let mut predicted_sorted = predicted.to_vec();
     predicted_sorted.sort_by(note_order);
     let mut reference_sorted = reference.to_vec();
@@ -1268,6 +1793,7 @@ pub fn evaluate_notes(predicted: &[TranscribedNote], reference: &[GroundTruthNot
         reference_notes: ref_len,
         ..NoteMetrics::default()
     };
+    let mut events = Vec::new();
 
     let mut i = 0usize;
     let mut j = 0usize;
@@ -1290,63 +1816,177 @@ pub fn evaluate_notes(predicted: &[TranscribedNote], reference: &[GroundTruthNot
                     if assessment.full_note_match {
                         metrics.matched_notes += 1;
                     }
+                    events.push(build_matched_event(
+                        &predicted_sorted[i],
+                        &reference_sorted[j],
+                        assessment,
+                    ));
+                } else {
+                    events.push(build_unmatched_predicted_event(
+                        &predicted_sorted[i],
+                        &reference_sorted,
+                    ));
+                    events.push(build_unmatched_reference_event(
+                        &reference_sorted[j],
+                        &predicted_sorted,
+                    ));
                 }
                 i += 1;
                 j += 1;
             }
-            AlignmentStep::SkipPredicted => i += 1,
-            AlignmentStep::SkipReference => j += 1,
+            AlignmentStep::SkipPredicted => {
+                events.push(build_unmatched_predicted_event(
+                    &predicted_sorted[i],
+                    &reference_sorted,
+                ));
+                i += 1;
+            }
+            AlignmentStep::SkipReference => {
+                events.push(build_unmatched_reference_event(
+                    &reference_sorted[j],
+                    &predicted_sorted,
+                ));
+                j += 1;
+            }
         }
     }
 
-    metrics
+    while i < pred_len {
+        events.push(build_unmatched_predicted_event(
+            &predicted_sorted[i],
+            &reference_sorted,
+        ));
+        i += 1;
+    }
+    while j < ref_len {
+        events.push(build_unmatched_reference_event(
+            &reference_sorted[j],
+            &predicted_sorted,
+        ));
+        j += 1;
+    }
+
+    NoteDiagnostics {
+        bucket_counts: bucket_counts_from_events(&events),
+        error_summary: error_summary_from_events(&events),
+        metrics,
+        events,
+    }
 }
 
 pub fn evaluate_source_separated(
     predicted: &[TranscribedNote],
     references: &[Vec<GroundTruthNote>],
 ) -> EvalSummary {
+    let detailed = evaluate_source_separated_detailed(predicted, references);
+    EvalSummary {
+        per_source: detailed
+            .per_source
+            .iter()
+            .map(|source| SourceEval {
+                source_id: source.source_id,
+                stream_id: source.stream_id,
+                metrics: source.diagnostics.metrics.clone(),
+            })
+            .collect(),
+        total: detailed.diagnostics.metrics,
+    }
+}
+
+pub fn evaluate_source_separated_detailed(
+    predicted: &[TranscribedNote],
+    references: &[Vec<GroundTruthNote>],
+) -> SourceSeparatedDiagnostics {
+    let source_labels: Vec<_> = references
+        .iter()
+        .enumerate()
+        .map(|(source_id, _)| format!("source_{source_id}"))
+        .collect();
+    evaluate_source_separated_detailed_with_labels(predicted, references, &source_labels)
+}
+
+fn evaluate_source_separated_detailed_with_labels(
+    predicted: &[TranscribedNote],
+    references: &[Vec<GroundTruthNote>],
+    source_labels: &[String],
+) -> SourceSeparatedDiagnostics {
     let predicted_by_stream = group_predicted_by_stream(predicted);
-    let stream_ids: Vec<usize> = predicted_by_stream.keys().copied().collect();
+    let mut stream_ids: Vec<usize> = predicted_by_stream.keys().copied().collect();
+    stream_ids.sort_unstable();
 
     let mut candidates = Vec::new();
     for (source_id, reference_notes) in references.iter().enumerate() {
         for &stream_id in &stream_ids {
-            let metrics = evaluate_notes(&predicted_by_stream[&stream_id], reference_notes);
-            let score = metrics.fuzzy_score_percent();
-            candidates.push((score, source_id, stream_id, metrics));
+            let diagnostics =
+                evaluate_notes_detailed(&predicted_by_stream[&stream_id], reference_notes);
+            let score = diagnostics.metrics.fuzzy_score_percent();
+            candidates.push((score, source_id, stream_id, diagnostics));
         }
     }
     candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
 
     let mut used_sources = HashSet::new();
     let mut used_streams = HashSet::new();
-    let mut per_source = vec![SourceEval::default(); references.len()];
+    let mut per_source: Vec<Option<SourceDiagnostic>> = vec![None; references.len()];
 
-    for (_, source_id, stream_id, metrics) in candidates {
+    for (_, source_id, stream_id, diagnostics) in candidates {
         if used_sources.contains(&source_id) || used_streams.contains(&stream_id) {
             continue;
         }
-        if metrics.matched_similarity <= 0.0 {
+        if diagnostics.metrics.matched_similarity <= 0.0 {
             continue;
         }
         used_sources.insert(source_id);
         used_streams.insert(stream_id);
-        per_source[source_id] = SourceEval {
+        per_source[source_id] = Some(SourceDiagnostic {
             source_id,
+            label: source_labels
+                .get(source_id)
+                .cloned()
+                .unwrap_or_else(|| format!("source_{source_id}")),
             stream_id: Some(stream_id),
-            metrics,
-        };
+            diagnostics,
+        });
     }
 
-    let mut total = NoteMetrics::default();
-    for eval in &per_source {
-        accumulate_note_metrics(&mut total, &eval.metrics);
+    let mut resolved_sources = Vec::with_capacity(references.len());
+    for (source_id, reference_notes) in references.iter().enumerate() {
+        let source = per_source[source_id].clone().unwrap_or_else(|| SourceDiagnostic {
+            source_id,
+            label: source_labels
+                .get(source_id)
+                .cloned()
+                .unwrap_or_else(|| format!("source_{source_id}")),
+            stream_id: None,
+            diagnostics: evaluate_notes_detailed(&[], reference_notes),
+        });
+        resolved_sources.push(source);
     }
-    total.predicted_notes = predicted.len();
-    total.reference_notes = references.iter().map(|notes| notes.len()).sum();
 
-    EvalSummary { per_source, total }
+    let mut unassigned_streams = Vec::new();
+    for stream_id in stream_ids {
+        if used_streams.contains(&stream_id) {
+            continue;
+        }
+        let diagnostics = evaluate_notes_detailed(&predicted_by_stream[&stream_id], &[]);
+        unassigned_streams.push(StreamDiagnostic {
+            stream_id,
+            diagnostics,
+        });
+    }
+
+    let diagnostics = merge_note_diagnostics(
+        resolved_sources
+            .iter()
+            .map(|source| &source.diagnostics)
+            .chain(unassigned_streams.iter().map(|stream| &stream.diagnostics)),
+    );
+
+    SourceSeparatedDiagnostics {
+        diagnostics,
+        per_source: resolved_sources,
+        unassigned_streams,
+    }
 }
 
 fn group_predicted_by_stream(
@@ -1362,13 +2002,219 @@ fn group_predicted_by_stream(
     grouped
 }
 
-fn note_salience(cqt: &[f32]) -> [f32; 128] {
+fn build_matched_event(
+    predicted: &TranscribedNote,
+    reference: &GroundTruthNote,
+    assessment: MatchAssessment,
+) -> DiagnosticEvent {
+    DiagnosticEvent {
+        bucket: classify_matched_bucket(predicted, reference, assessment),
+        source_id: Some(reference.source_id),
+        stream_id: Some(predicted.stream_id),
+        matched: true,
+        similarity: assessment.similarity,
+        pitch_error_semitones: Some(assessment.pitch_error_semitones),
+        start_error_ms: Some(assessment.start_error_secs * 1000.0),
+        end_error_ms: Some(assessment.end_error_secs * 1000.0),
+        predicted: Some(predicted.clone()),
+        reference: Some(reference.clone()),
+    }
+}
+
+fn build_unmatched_predicted_event(
+    predicted: &TranscribedNote,
+    reference_notes: &[GroundTruthNote],
+) -> DiagnosticEvent {
+    DiagnosticEvent {
+        bucket: classify_unmatched_predicted_bucket(predicted, reference_notes),
+        source_id: None,
+        stream_id: Some(predicted.stream_id),
+        matched: false,
+        similarity: 0.0,
+        pitch_error_semitones: None,
+        start_error_ms: None,
+        end_error_ms: None,
+        predicted: Some(predicted.clone()),
+        reference: None,
+    }
+}
+
+fn build_unmatched_reference_event(
+    reference: &GroundTruthNote,
+    predicted_notes: &[TranscribedNote],
+) -> DiagnosticEvent {
+    DiagnosticEvent {
+        bucket: classify_unmatched_reference_bucket(reference, predicted_notes),
+        source_id: Some(reference.source_id),
+        stream_id: None,
+        matched: false,
+        similarity: 0.0,
+        pitch_error_semitones: None,
+        start_error_ms: None,
+        end_error_ms: None,
+        predicted: None,
+        reference: Some(reference.clone()),
+    }
+}
+
+fn classify_matched_bucket(
+    predicted: &TranscribedNote,
+    reference: &GroundTruthNote,
+    assessment: MatchAssessment,
+) -> FailureBucket {
+    if assessment.full_note_match {
+        return FailureBucket::Correct;
+    }
+
+    if assessment.pitch_error_semitones >= 11.5
+        && (assessment.pitch_error_semitones % 12.0) <= 0.5
+    {
+        return FailureBucket::OctaveError;
+    }
+    if assessment.pitch_error_semitones >= 0.5 {
+        return FailureBucket::PitchError;
+    }
+
+    let start_delta = predicted.start_secs - reference.start_secs;
+    let end_delta = predicted.end_secs - reference.end_secs;
+    let start_bad = start_delta.abs() > START_TOLERANCE_SECS;
+    let end_bad = end_delta.abs() > END_TOLERANCE_SECS;
+
+    match (start_bad, end_bad) {
+        (true, true) => FailureBucket::TimingDrift,
+        (true, false) if start_delta < 0.0 => FailureBucket::EarlyOnset,
+        (true, false) => FailureBucket::LateOnset,
+        (false, true) if end_delta < 0.0 => FailureBucket::EarlyRelease,
+        (false, true) => FailureBucket::LateRelease,
+        _ => FailureBucket::TimingDrift,
+    }
+}
+
+fn classify_unmatched_predicted_bucket(
+    predicted: &TranscribedNote,
+    reference_notes: &[GroundTruthNote],
+) -> FailureBucket {
+    let overlaps_same_pitch = reference_notes
+        .iter()
+        .any(|reference| reference.midi_note == predicted.midi_note && notes_overlap(predicted, reference));
+    if overlaps_same_pitch {
+        FailureBucket::SplitLikely
+    } else {
+        FailureBucket::ExtraNote
+    }
+}
+
+fn classify_unmatched_reference_bucket(
+    reference: &GroundTruthNote,
+    predicted_notes: &[TranscribedNote],
+) -> FailureBucket {
+    let overlaps_same_pitch = predicted_notes
+        .iter()
+        .any(|predicted| predicted.midi_note == reference.midi_note && notes_overlap(predicted, reference));
+    if overlaps_same_pitch {
+        FailureBucket::MergeLikely
+    } else {
+        FailureBucket::MissedNote
+    }
+}
+
+fn notes_overlap(predicted: &TranscribedNote, reference: &GroundTruthNote) -> bool {
+    let overlap_start = predicted.start_secs.max(reference.start_secs);
+    let overlap_end = predicted.end_secs.min(reference.end_secs);
+    let overlap = (overlap_end - overlap_start).max(0.0);
+    let min_duration = (predicted.end_secs - predicted.start_secs)
+        .min(reference.end_secs - reference.start_secs)
+        .max(1e-3);
+    overlap / min_duration >= 0.35
+}
+
+fn bucket_counts_from_events(events: &[DiagnosticEvent]) -> Vec<BucketCount> {
+    let mut counts: BTreeMap<FailureBucket, usize> = BTreeMap::new();
+    for event in events {
+        *counts.entry(event.bucket).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(bucket, count)| BucketCount { bucket, count })
+        .collect()
+}
+
+fn error_summary_from_events(events: &[DiagnosticEvent]) -> ErrorSummary {
+    let pitch_values: Vec<f32> = events
+        .iter()
+        .filter_map(|event| event.pitch_error_semitones)
+        .collect();
+    let start_values: Vec<f32> = events
+        .iter()
+        .filter_map(|event| event.start_error_ms)
+        .collect();
+    let end_values: Vec<f32> = events
+        .iter()
+        .filter_map(|event| event.end_error_ms)
+        .collect();
+
+    ErrorSummary {
+        pitch_error_semitones: summarize_error_values(&pitch_values),
+        start_error_ms: summarize_error_values(&start_values),
+        end_error_ms: summarize_error_values(&end_values),
+    }
+}
+
+fn summarize_error_values(values: &[f32]) -> ErrorStats {
+    if values.is_empty() {
+        return ErrorStats::default();
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let count = sorted.len();
+    let mean = sorted.iter().sum::<f32>() / count as f32;
+
+    ErrorStats {
+        count,
+        mean,
+        p50: percentile(&sorted, 0.50),
+        p90: percentile(&sorted, 0.90),
+        max: sorted.last().copied().unwrap_or(0.0),
+    }
+}
+
+fn percentile(sorted: &[f32], quantile: f32) -> f32 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() - 1) as f32 * quantile.clamp(0.0, 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn merge_note_diagnostics<'a>(
+    diagnostics: impl IntoIterator<Item = &'a NoteDiagnostics>,
+) -> NoteDiagnostics {
+    let mut metrics = NoteMetrics::default();
+    let mut events = Vec::new();
+    for diagnostic in diagnostics {
+        accumulate_note_metrics(&mut metrics, &diagnostic.metrics);
+        events.extend(diagnostic.events.iter().cloned());
+    }
+    NoteDiagnostics {
+        bucket_counts: bucket_counts_from_events(&events),
+        error_summary: error_summary_from_events(&events),
+        metrics,
+        events,
+    }
+}
+
+fn note_evidence(cqt: &[f32]) -> NoteEvidenceFrame {
     let bank = note_template_bank();
     let frame: Vec<f32> = cqt.iter().map(|&value| value.max(0.0).sqrt()).collect();
     let frame_norm = frame.iter().map(|value| value * value).sum::<f32>().sqrt();
     let mut salience = [0.0f32; 128];
+    let mut absolute_strength = [0.0f32; 128];
     if frame_norm <= 1e-6 {
-        return salience;
+        return NoteEvidenceFrame {
+            salience,
+            absolute_strength,
+        };
     }
 
     for midi_note in TRANSCRIPTION_MIDI_LOW..=TRANSCRIPTION_MIDI_HIGH {
@@ -1384,10 +2230,16 @@ fn note_salience(cqt: &[f32]) -> [f32; 128] {
             .map(|(sample, weight)| sample * weight)
             .sum::<f32>();
         let similarity = (dot / frame_norm).clamp(0.0, 1.0);
+        let projection = dot.clamp(0.0, 1.0);
         salience[midi_note as usize] =
             (0.55 * similarity + 0.45 * fundamental - 0.10 * sub_octave).clamp(0.0, 1.0);
+        absolute_strength[midi_note as usize] =
+            (0.65 * projection + 0.35 * fundamental - 0.08 * sub_octave).clamp(0.0, 1.0);
     }
-    salience
+    NoteEvidenceFrame {
+        salience,
+        absolute_strength,
+    }
 }
 
 fn note_template_bank() -> &'static [[f32; CQT_BINS]; CQT_BINS] {
@@ -1444,12 +2296,16 @@ fn interp_cqt(cqt: &[f32], bin: f32) -> f32 {
 
 fn select_note_activations(
     salience: &[f32; 128],
+    absolute_strength: &[f32; 128],
     note_energy_ema: &[f32; 128],
+    peak_salience_ref: f32,
+    register_peak_refs: &[f32; 3],
+    collapse_guard: f32,
     harmonic_confidence: f32,
     pitched_stability: f32,
     max_streams: usize,
 ) -> Vec<NoteActivation> {
-    let global_max = salience
+    let global_max = absolute_strength
         [TRANSCRIPTION_MIDI_LOW as usize..=TRANSCRIPTION_MIDI_HIGH as usize]
         .iter()
         .copied()
@@ -1460,34 +2316,88 @@ fn select_note_activations(
     {
         let idx = midi_note as usize;
         let center = salience[idx];
+        let absolute_center = absolute_strength[idx];
+        let register = pitch_register(midi_note);
         if center < salience[idx - 1] || center < salience[idx + 1] {
             continue;
         }
-        let dynamic_floor = (global_max * 0.32).max(note_energy_ema[idx] * 0.92).max(
-            if harmonic_confidence >= 0.2 || pitched_stability >= 0.2 {
-                0.05
+        let local_contrast = (center - 0.5 * (salience[idx - 1] + salience[idx + 1])).max(0.0);
+        if local_contrast < HARMONIC_LOCAL_CONTRAST_MIN {
+            continue;
+        }
+        let dynamic_floor = (global_max * 0.24)
+            .max(note_energy_ema[idx] * 0.84)
+            .max(peak_salience_ref * (0.06 + 0.08 * collapse_guard))
+            .max(register_peak_refs[register] * (0.14 + 0.10 * collapse_guard))
+            .max(if harmonic_confidence >= 0.2 || pitched_stability >= 0.2 {
+                0.04
             } else {
-                0.07
-            },
-        );
-        if center < dynamic_floor {
+                0.055
+            });
+        if absolute_center < dynamic_floor {
+            continue;
+        }
+        if midi_note <= 40 && salience[(idx + 12).min(127)] > center * 1.12 {
             continue;
         }
 
         peaks.push(NoteActivation {
             midi_note,
             salience: center,
+            absolute_strength: absolute_center,
             brightness: idx as f32 / TRANSCRIPTION_MIDI_HIGH as f32,
+            local_contrast,
+            register,
         });
     }
 
     peaks.sort_by(|a, b| {
-        b.salience
-            .partial_cmp(&a.salience)
+        (0.55 * b.salience + 0.45 * b.absolute_strength)
+            .partial_cmp(&(0.55 * a.salience + 0.45 * a.absolute_strength))
             .unwrap_or(Ordering::Equal)
     });
-    peaks.truncate(MAX_POLYPHONIC_CANDIDATES.max(max_streams * 2));
-    peaks
+    let mut filtered = Vec::with_capacity(peaks.len());
+    for candidate in peaks {
+        if filtered.iter().any(|selected: &NoteActivation| {
+            semitone_distance(selected.midi_note, candidate.midi_note) <= 1
+                && selected.salience >= candidate.salience * 0.92
+        }) {
+            continue;
+        }
+        filtered.push(candidate);
+        if filtered.len() >= MAX_POLYPHONIC_CANDIDATES.max(max_streams * 2) {
+            break;
+        }
+    }
+    filtered
+}
+
+fn evidence_frame_stats(evidence: &[f32; 128]) -> SalienceFrameStats {
+    let mut stats = SalienceFrameStats::default();
+    for midi_note in TRANSCRIPTION_MIDI_LOW..=TRANSCRIPTION_MIDI_HIGH {
+        let value = evidence[midi_note as usize];
+        stats.global_peak = stats.global_peak.max(value);
+        stats.total_energy += value;
+        let register = pitch_register(midi_note);
+        stats.register_peaks[register] = stats.register_peaks[register].max(value);
+    }
+    stats
+}
+
+fn pitch_register(midi_note: u8) -> usize {
+    match midi_note {
+        ..=45 => 0,
+        46..=69 => 1,
+        _ => 2,
+    }
+}
+
+fn update_reference_envelope(previous: f32, current: f32, decay: f32) -> f32 {
+    if current >= previous {
+        previous * 0.60 + current * 0.40
+    } else {
+        (previous * decay).max(current)
+    }
 }
 
 fn harmonic_note_distance(note: &RealtimeActiveNote, candidate: &NoteActivation) -> f32 {
@@ -1928,6 +2838,317 @@ fn mix_label(pairs: &[LoadedPair], mix_indices: &[usize]) -> String {
         .join(" + ")
 }
 
+pub fn build_standardized_evaluation_report(
+    dir: &Path,
+) -> Result<EvaluationSuiteReport, Box<dyn Error>> {
+    let pairs = standardized_test_pairs(dir)?;
+    let mut cases = Vec::new();
+
+    for pair in &pairs {
+        let predicted = transcribe_clip(&pair.clip, 1);
+        let diagnostics = evaluate_notes_detailed(&predicted, &pair.notes);
+        let tags = single_source_tags(pair);
+        cases.push(EvaluationCaseReport {
+            label: pair.pair.stem.clone(),
+            kind: EvaluationCaseKind::SingleSource,
+            source_count: 1,
+            sample_rate: pair.clip.sample_rate,
+            tags: tags.clone(),
+            per_source: vec![SourceDiagnostic {
+                source_id: 0,
+                label: pair.pair.stem.clone(),
+                stream_id: None,
+                diagnostics: diagnostics.clone(),
+            }],
+            unassigned_streams: Vec::new(),
+            diagnostics,
+        });
+    }
+
+    for &mix_count in STANDARD_MIX_SIZES {
+        let mix_index_sets = standardized_mix_index_sets(&pairs, mix_count)?;
+        for mix_indices in &mix_index_sets {
+            let clips: Vec<_> = mix_indices
+                .iter()
+                .map(|&pair_idx| pairs[pair_idx].clip.clone())
+                .collect();
+            let mixed = mix_clips(&clips)?;
+            let predicted = transcribe_clip(&mixed, mix_count);
+            let references: Vec<_> = mix_indices
+                .iter()
+                .enumerate()
+                .map(|(source_id, &pair_idx)| {
+                    pairs[pair_idx]
+                        .notes
+                        .iter()
+                        .cloned()
+                        .map(|mut note| {
+                            note.source_id = source_id;
+                            note
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let source_labels: Vec<_> = mix_indices
+                .iter()
+                .map(|&pair_idx| pairs[pair_idx].pair.stem.clone())
+                .collect();
+            let detailed =
+                evaluate_source_separated_detailed_with_labels(&predicted, &references, &source_labels);
+            cases.push(EvaluationCaseReport {
+                label: mix_label(&pairs, mix_indices),
+                kind: match mix_count {
+                    2 => EvaluationCaseKind::Mix2Source,
+                    3 => EvaluationCaseKind::Mix3Source,
+                    _ => unreachable!("standardized mix sizes are validated"),
+                },
+                source_count: mix_count,
+                sample_rate: mixed.sample_rate,
+                tags: mix_tags(mix_count),
+                diagnostics: detailed.diagnostics,
+                per_source: detailed.per_source,
+                unassigned_streams: detailed.unassigned_streams,
+            });
+        }
+    }
+
+    let overall = build_slice_report("overall", &cases);
+    let mut slices = Vec::new();
+    for (label, tag) in [
+        ("single_source", "single_source"),
+        ("mix_2_source", "mix_2_source"),
+        ("mix_3_source", "mix_3_source"),
+        ("single_monophonic", "single_monophonic"),
+        ("single_polyphonic", "single_polyphonic"),
+        ("single_percussive", "single_percussive"),
+        ("single_pitched", "single_pitched"),
+    ] {
+        if let Some(slice) = build_tagged_slice_report(label, &cases, tag) {
+            slices.push(slice);
+        }
+    }
+
+    Ok(EvaluationSuiteReport {
+        dataset_dir: dir.display().to_string(),
+        overall,
+        slices,
+        cases,
+    })
+}
+
+pub fn format_evaluation_report(report: &EvaluationSuiteReport) -> String {
+    let mut out = String::new();
+    let overall = &report.overall.diagnostics.metrics;
+    out.push_str(&format!(
+        "Dataset: {}\nOverall: {:>6.2}%  predicted {:>4}  reference {:>4}  matched_pairs {:>4}  start {:>6.1}ms  end {:>6.1}ms  pitch {:>5.1}c\n",
+        report.dataset_dir,
+        overall.fuzzy_score_percent(),
+        overall.predicted_notes,
+        overall.reference_notes,
+        overall.matched_pairs,
+        overall.mean_start_error_ms(),
+        overall.mean_end_error_ms(),
+        overall.mean_pitch_error_semitones() * 100.0,
+    ));
+    out.push_str(&format!(
+        "Top failure buckets: {}\n",
+        format_bucket_counts(&report.overall.diagnostics.bucket_counts, 6)
+    ));
+
+    out.push_str("\nSlices:\n");
+    for slice in &report.slices {
+        let metrics = &slice.diagnostics.metrics;
+        out.push_str(&format!(
+            "  {:<20} {:>6.2}%  cases {:>2}  matched_pairs {:>4}  buckets {}\n",
+            slice.label,
+            metrics.fuzzy_score_percent(),
+            slice.case_count,
+            metrics.matched_pairs,
+            format_bucket_counts(&slice.diagnostics.bucket_counts, 4),
+        ));
+    }
+
+    let mut worst_cases = report.cases.iter().collect::<Vec<_>>();
+    worst_cases.sort_by(|a, b| {
+        a.diagnostics
+            .metrics
+            .fuzzy_score_percent()
+            .partial_cmp(&b.diagnostics.metrics.fuzzy_score_percent())
+            .unwrap_or(Ordering::Equal)
+    });
+    out.push_str("\nWorst cases:\n");
+    for case in worst_cases.into_iter().take(8) {
+        let metrics = &case.diagnostics.metrics;
+        out.push_str(&format!(
+            "  {:<100} {:>6.2}%  pitch {:>5.1}c  start {:>6.1}ms  end {:>6.1}ms  {}\n",
+            case.label,
+            metrics.fuzzy_score_percent(),
+            metrics.mean_pitch_error_semitones() * 100.0,
+            metrics.mean_start_error_ms(),
+            metrics.mean_end_error_ms(),
+            format_bucket_counts(&case.diagnostics.bucket_counts, 3),
+        ));
+    }
+
+    out
+}
+
+pub fn summarize_evaluation_report(report: &EvaluationSuiteReport) -> EvaluationSuiteSummary {
+    EvaluationSuiteSummary {
+        dataset_dir: report.dataset_dir.clone(),
+        overall: EvaluationSliceSummary {
+            label: report.overall.label.clone(),
+            case_count: report.overall.case_count,
+            diagnostics: summarize_note_diagnostics(&report.overall.diagnostics, 8),
+        },
+        slices: report
+            .slices
+            .iter()
+            .map(|slice| EvaluationSliceSummary {
+                label: slice.label.clone(),
+                case_count: slice.case_count,
+                diagnostics: summarize_note_diagnostics(&slice.diagnostics, 6),
+            })
+            .collect(),
+        cases: report
+            .cases
+            .iter()
+            .map(|case| EvaluationCaseSummary {
+                label: case.label.clone(),
+                kind: case.kind,
+                source_count: case.source_count,
+                diagnostics: summarize_note_diagnostics(&case.diagnostics, 4),
+            })
+            .collect(),
+    }
+}
+
+fn summarize_note_diagnostics(
+    diagnostics: &NoteDiagnostics,
+    bucket_limit: usize,
+) -> DiagnosticSummary {
+    DiagnosticSummary {
+        metrics: summarize_note_metrics(&diagnostics.metrics),
+        bucket_counts: trim_bucket_counts(&diagnostics.bucket_counts, bucket_limit),
+        error_summary: summarize_error_summary(&diagnostics.error_summary),
+    }
+}
+
+fn summarize_note_metrics(metrics: &NoteMetrics) -> NoteMetricSummary {
+    NoteMetricSummary {
+        score_percent: round2(metrics.fuzzy_score_percent()),
+        predicted_notes: metrics.predicted_notes,
+        reference_notes: metrics.reference_notes,
+        matched_pairs: metrics.matched_pairs,
+        matched_onsets: metrics.matched_onsets,
+        matched_notes: metrics.matched_notes,
+        mean_pitch_error_cents: round1(metrics.mean_pitch_error_semitones() * 100.0),
+        mean_start_error_ms: round1(metrics.mean_start_error_ms()),
+        mean_end_error_ms: round1(metrics.mean_end_error_ms()),
+    }
+}
+
+fn summarize_error_summary(summary: &ErrorSummary) -> ErrorSummary {
+    ErrorSummary {
+        pitch_error_semitones: summarize_error_stats(&summary.pitch_error_semitones),
+        start_error_ms: summarize_error_stats(&summary.start_error_ms),
+        end_error_ms: summarize_error_stats(&summary.end_error_ms),
+    }
+}
+
+fn summarize_error_stats(stats: &ErrorStats) -> ErrorStats {
+    ErrorStats {
+        count: stats.count,
+        mean: round2(stats.mean),
+        p50: round2(stats.p50),
+        p90: round2(stats.p90),
+        max: round2(stats.max),
+    }
+}
+
+fn trim_bucket_counts(bucket_counts: &[BucketCount], limit: usize) -> Vec<BucketCount> {
+    let mut trimmed = bucket_counts.to_vec();
+    trimmed.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.bucket.cmp(&b.bucket)));
+    if limit > 0 && trimmed.len() > limit {
+        trimmed.truncate(limit);
+    }
+    trimmed
+}
+
+fn round1(value: f32) -> f32 {
+    (value * 10.0).round() / 10.0
+}
+
+fn round2(value: f32) -> f32 {
+    (value * 100.0).round() / 100.0
+}
+
+fn build_tagged_slice_report(
+    label: &str,
+    cases: &[EvaluationCaseReport],
+    tag: &str,
+) -> Option<EvaluationSliceReport> {
+    let tagged: Vec<_> = cases
+        .iter()
+        .filter(|case| case.tags.iter().any(|case_tag| case_tag == tag))
+        .collect();
+    if tagged.is_empty() {
+        None
+    } else {
+        Some(build_slice_report_from_refs(label, &tagged))
+    }
+}
+
+fn build_slice_report(label: &str, cases: &[EvaluationCaseReport]) -> EvaluationSliceReport {
+    let refs = cases.iter().collect::<Vec<_>>();
+    build_slice_report_from_refs(label, &refs)
+}
+
+fn build_slice_report_from_refs(
+    label: &str,
+    cases: &[&EvaluationCaseReport],
+) -> EvaluationSliceReport {
+    EvaluationSliceReport {
+        label: label.to_owned(),
+        case_count: cases.len(),
+        diagnostics: merge_note_diagnostics(cases.iter().map(|case| &case.diagnostics)),
+    }
+}
+
+fn single_source_tags(pair: &LoadedPair) -> Vec<String> {
+    let mut tags = vec!["single_source".to_owned()];
+    if pair.max_polyphony <= 1 {
+        tags.push("single_monophonic".to_owned());
+    } else {
+        tags.push("single_polyphonic".to_owned());
+    }
+    let stem = pair.pair.stem.to_ascii_lowercase();
+    if PERCUSSION_KEYWORDS.iter().any(|keyword| stem.contains(keyword)) {
+        tags.push("single_percussive".to_owned());
+    } else {
+        tags.push("single_pitched".to_owned());
+    }
+    tags
+}
+
+fn mix_tags(mix_count: usize) -> Vec<String> {
+    vec![format!("mix_{mix_count}_source")]
+}
+
+fn format_bucket_counts(bucket_counts: &[BucketCount], limit: usize) -> String {
+    let mut buckets = bucket_counts.to_vec();
+    buckets.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.bucket.cmp(&b.bucket)));
+    if buckets.is_empty() {
+        return "none".to_owned();
+    }
+    buckets
+        .into_iter()
+        .take(limit)
+        .map(|bucket| format!("{:?}={}", bucket.bucket, bucket.count))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2007,102 +3228,347 @@ mod tests {
     }
 
     #[test]
+    fn detailed_evaluation_buckets_common_failures() {
+        let reference = vec![
+            GroundTruthNote {
+                source_id: 0,
+                midi_note: 60,
+                start_secs: 0.0,
+                end_secs: 0.5,
+            },
+            GroundTruthNote {
+                source_id: 0,
+                midi_note: 64,
+                start_secs: 1.0,
+                end_secs: 1.4,
+            },
+        ];
+        let predicted = vec![
+            TranscribedNote {
+                stream_id: 0,
+                midi_note: 72,
+                start_secs: 0.0,
+                end_secs: 0.5,
+                confidence: 1.0,
+            },
+            TranscribedNote {
+                stream_id: 0,
+                midi_note: 67,
+                start_secs: 1.02,
+                end_secs: 1.10,
+                confidence: 0.8,
+            },
+            TranscribedNote {
+                stream_id: 0,
+                midi_note: 69,
+                start_secs: 2.0,
+                end_secs: 2.2,
+                confidence: 0.6,
+            },
+        ];
+
+        let diagnostics = evaluate_notes_detailed(&predicted, &reference);
+        let buckets: HashSet<_> = diagnostics.events.iter().map(|event| event.bucket).collect();
+        assert!(buckets.contains(&FailureBucket::OctaveError));
+        assert!(buckets.contains(&FailureBucket::PitchError));
+        assert!(buckets.contains(&FailureBucket::ExtraNote));
+    }
+
+    #[test]
+    fn formatted_report_contains_overall_and_slices() {
+        let diagnostics = evaluate_notes_detailed(&[], &[]);
+        let report = EvaluationSuiteReport {
+            dataset_dir: "midi".to_owned(),
+            overall: EvaluationSliceReport {
+                label: "overall".to_owned(),
+                case_count: 1,
+                diagnostics: diagnostics.clone(),
+            },
+            slices: vec![EvaluationSliceReport {
+                label: "single_source".to_owned(),
+                case_count: 1,
+                diagnostics: diagnostics.clone(),
+            }],
+            cases: vec![EvaluationCaseReport {
+                label: "fixture".to_owned(),
+                kind: EvaluationCaseKind::SingleSource,
+                source_count: 1,
+                sample_rate: 44_100,
+                tags: vec!["single_source".to_owned()],
+                diagnostics,
+                per_source: Vec::new(),
+                unassigned_streams: Vec::new(),
+            }],
+        };
+
+        let formatted = format_evaluation_report(&report);
+        assert!(formatted.contains("Overall"));
+        assert!(formatted.contains("Slices"));
+        assert!(formatted.contains("Worst cases"));
+    }
+
+    #[test]
+    fn strong_birth_stays_immediate_through_collapse_guard() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.peak_salience_ref = 0.82;
+        transcriber.total_salience_ref = 2.8;
+        transcriber.register_peak_refs = [0.78, 0.46, 0.32];
+        transcriber.collapse_guard = 0.75;
+        transcriber.analyser.features.onset_confidence = 0.36;
+
+        let candidate = NoteActivation {
+            midi_note: 86,
+            salience: 0.44,
+            absolute_strength: 0.44,
+            brightness: 0.82,
+            local_contrast: 0.09,
+            register: pitch_register(86),
+        };
+
+        assert_eq!(
+            transcriber.classify_harmonic_birth(&candidate),
+            BirthDecision::Immediate
+        );
+    }
+
+    #[test]
+    fn weak_residual_birth_does_not_commit_after_normalization_collapse() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.peak_salience_ref = 0.88;
+        transcriber.total_salience_ref = 3.2;
+        transcriber.register_peak_refs = [0.82, 0.40, 0.22];
+        transcriber.collapse_guard = 0.80;
+        transcriber.analyser.features.harmonic_confidence = 0.24;
+        transcriber.analyser.features.pitched_stability = 0.24;
+
+        let candidate = NoteActivation {
+            midi_note: 92,
+            salience: 0.10,
+            absolute_strength: 0.10,
+            brightness: 0.88,
+            local_contrast: 0.016,
+            register: pitch_register(92),
+        };
+
+        assert_ne!(
+            transcriber.classify_harmonic_birth(&candidate),
+            BirthDecision::Immediate
+        );
+        transcriber.update_pending_harmonic_candidates(&[candidate], 0.00, 0.012);
+        assert!(transcriber.active_notes.is_empty());
+        transcriber.update_pending_harmonic_candidates(&[], 0.012, 0.080);
+        assert!(transcriber.active_notes.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_pending_birth_commits_after_two_hits() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.analyser.features.onset_confidence = 0.09;
+        transcriber.analyser.features.harmonic_confidence = 0.26;
+        transcriber.analyser.features.pitched_stability = 0.27;
+
+        let candidate = NoteActivation {
+            midi_note: 64,
+            salience: 0.12,
+            absolute_strength: 0.12,
+            brightness: 0.52,
+            local_contrast: 0.020,
+            register: pitch_register(64),
+        };
+
+        assert_eq!(
+            transcriber.classify_harmonic_birth(&candidate),
+            BirthDecision::Pending
+        );
+
+        transcriber.update_pending_harmonic_candidates(&[candidate], 0.00, 0.012);
+        assert!(transcriber.active_notes.is_empty());
+        assert_eq!(transcriber.pending_candidates.len(), 1);
+
+        transcriber.update_pending_harmonic_candidates(&[candidate], 0.012, 0.024);
+        assert_eq!(transcriber.active_notes.len(), 1);
+        assert!(transcriber.pending_candidates.is_empty());
+        assert!(transcriber.active_notes[0].start_secs <= 0.001);
+    }
+
+    #[test]
+    fn collapse_guard_limits_weak_birth_fanout() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.peak_salience_ref = 0.92;
+        transcriber.total_salience_ref = 3.5;
+        transcriber.register_peak_refs = [0.84, 0.42, 0.24];
+        transcriber.collapse_guard = 0.82;
+        transcriber.analyser.features.harmonic_confidence = 0.26;
+        transcriber.analyser.features.pitched_stability = 0.25;
+        transcriber.analyser.features.onset_confidence = 0.05;
+
+        let candidates = vec![
+            NoteActivation {
+                midi_note: 89,
+                salience: 0.125,
+                absolute_strength: 0.125,
+                brightness: 0.86,
+                local_contrast: 0.021,
+                register: pitch_register(89),
+            },
+            NoteActivation {
+                midi_note: 92,
+                salience: 0.118,
+                absolute_strength: 0.118,
+                brightness: 0.89,
+                local_contrast: 0.019,
+                register: pitch_register(92),
+            },
+            NoteActivation {
+                midi_note: 96,
+                salience: 0.111,
+                absolute_strength: 0.111,
+                brightness: 0.92,
+                local_contrast: 0.018,
+                register: pitch_register(96),
+            },
+        ];
+
+        transcriber.update_harmonic_notes(&candidates, 0.0, 0.012);
+        assert!(transcriber.active_notes.is_empty());
+        assert_eq!(transcriber.pending_candidates.len(), 1);
+        assert_eq!(transcriber.pending_candidates[0].midi_note, 89);
+    }
+
+    #[test]
+    fn mature_note_keeps_pitch_authority_and_new_pitch_births_separately() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.analyser.features.onset_confidence = 0.34;
+        transcriber.analyser.features.harmonic_confidence = 0.34;
+        transcriber.analyser.features.pitched_stability = 0.34;
+        transcriber.peak_salience_ref = 0.30;
+        transcriber.total_salience_ref = 1.8;
+        transcriber.register_peak_refs = [0.18, 0.28, 0.30];
+        transcriber.active_notes.push(RealtimeActiveNote {
+            id: 0,
+            stream_id: 0,
+            midi_note: 60,
+            start_secs: 0.0,
+            last_seen_secs: HARMONIC_PITCH_LOCK_SECS,
+            confidence: 0.22,
+            brightness: 0.56,
+            kind: ActiveKind::Harmonic,
+        });
+        transcriber.next_note_id = 1;
+
+        let candidate = NoteActivation {
+            midi_note: 62,
+            salience: 0.30,
+            absolute_strength: 0.30,
+            brightness: 0.58,
+            local_contrast: 0.05,
+            register: pitch_register(62),
+        };
+
+        transcriber.update_harmonic_notes(
+            &[candidate],
+            HARMONIC_PITCH_LOCK_SECS + 0.012,
+            HARMONIC_PITCH_LOCK_SECS + 0.024,
+        );
+
+        assert_eq!(transcriber.active_notes.len(), 2);
+        assert!(transcriber.active_notes.iter().any(|note| note.midi_note == 60));
+        assert!(transcriber.active_notes.iter().any(|note| note.midi_note == 62));
+    }
+
+    #[test]
+    fn fresh_note_can_still_relock_during_short_settle_window() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.active_notes.push(RealtimeActiveNote {
+            id: 0,
+            stream_id: 0,
+            midi_note: 60,
+            start_secs: 0.0,
+            last_seen_secs: 0.012,
+            confidence: 0.20,
+            brightness: 0.54,
+            kind: ActiveKind::Harmonic,
+        });
+
+        let candidate = NoteActivation {
+            midi_note: 62,
+            salience: 0.28,
+            absolute_strength: 0.28,
+            brightness: 0.56,
+            local_contrast: 0.04,
+            register: pitch_register(62),
+        };
+
+        transcriber.update_harmonic_notes(&[candidate], 0.020, 0.032);
+
+        assert_eq!(transcriber.active_notes.len(), 1);
+        assert_eq!(transcriber.active_notes[0].midi_note, 62);
+    }
+
+    #[test]
+    fn strong_onset_can_still_start_multiple_notes_during_collapse() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.peak_salience_ref = 0.88;
+        transcriber.total_salience_ref = 3.0;
+        transcriber.register_peak_refs = [0.82, 0.44, 0.28];
+        transcriber.collapse_guard = 0.78;
+        transcriber.analyser.features.onset_confidence = 0.38;
+        transcriber.analyser.features.harmonic_confidence = 0.34;
+        transcriber.analyser.features.pitched_stability = 0.32;
+
+        let candidates = vec![
+            NoteActivation {
+                midi_note: 69,
+                salience: 0.46,
+                absolute_strength: 0.46,
+                brightness: 0.66,
+                local_contrast: 0.11,
+                register: pitch_register(69),
+            },
+            NoteActivation {
+                midi_note: 76,
+                salience: 0.41,
+                absolute_strength: 0.41,
+                brightness: 0.73,
+                local_contrast: 0.09,
+                register: pitch_register(76),
+            },
+        ];
+
+        transcriber.update_harmonic_notes(&candidates, 0.0, 0.012);
+        assert_eq!(transcriber.active_notes.len(), 2);
+    }
+
+    #[test]
+    fn bright_residual_does_not_emit_fallback_percussion() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.analyser.features.is_onset = true;
+        transcriber.analyser.features.onset_confidence = 0.32;
+        transcriber.analyser.features.percussive_confidence = 0.34;
+        transcriber.analyser.features.brightness = 0.82;
+        transcriber.emit_percussive_notes(0.0);
+        assert!(transcriber.finished_notes.is_empty());
+    }
+
+    #[test]
+    fn strong_hihat_still_emits_immediately() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.analyser.features.hihat = true;
+        transcriber.analyser.features.hihat_strength = 0.18;
+        transcriber.analyser.features.onset_confidence = 0.36;
+        transcriber.analyser.features.percussive_confidence = 0.42;
+        transcriber.analyser.features.brightness = 0.83;
+        transcriber.emit_percussive_notes(0.0);
+        assert_eq!(transcriber.finished_notes.len(), 1);
+        assert_eq!(transcriber.finished_notes[0].note.midi_note, DRUM_HIHAT_NOTE);
+    }
+
+    #[test]
     #[ignore]
     fn report_current_dataset_scores() {
-        let pairs =
-            standardized_test_pairs(Path::new(DATASET_DIR)).expect("failed to load score fixtures");
-        let mut single_total = NoteMetrics::default();
-        let mut two_mix_total = NoteMetrics::default();
-        let mut three_mix_total = NoteMetrics::default();
-
-        eprintln!("fixtures:");
-        for pair in &pairs {
-            eprintln!("  {}", pair.pair.stem);
-        }
-
-        eprintln!("single-source:");
-        for pair in &pairs {
-            let predicted = transcribe_clip(&pair.clip, 1);
-            let metrics = evaluate_notes(&predicted, &pair.notes);
-            eprintln!(
-                "  {:<45} score {:>6.2}%  matched_pairs {:>3}  pitch {:>5.1}c  start {:>6.1}ms  end {:>6.1}ms",
-                pair.pair.stem,
-                metrics.fuzzy_score_percent(),
-                metrics.matched_pairs,
-                metrics.mean_pitch_error_semitones() * 100.0,
-                metrics.mean_start_error_ms(),
-                metrics.mean_end_error_ms(),
-            );
-            accumulate_note_metrics(&mut single_total, &metrics);
-        }
-
-        eprintln!("mixed-source:");
-        for &mix_count in STANDARD_MIX_SIZES {
-            let mix_index_sets = standardized_mix_index_sets(&pairs, mix_count)
-                .expect("failed to build standardized mix fixture set");
-            for (mix_idx, mix_indices) in mix_index_sets.iter().enumerate() {
-                let clips: Vec<_> = mix_indices
-                    .iter()
-                    .map(|&pair_idx| pairs[pair_idx].clip.clone())
-                    .collect();
-                let mixed = mix_clips(&clips).expect("failed to build synthetic mix");
-                let predicted = transcribe_clip(&mixed, mix_count);
-                let references: Vec<_> = mix_indices
-                    .iter()
-                    .enumerate()
-                    .map(|(source_id, &pair_idx)| {
-                        pairs[pair_idx]
-                            .notes
-                            .iter()
-                            .cloned()
-                            .map(|mut note| {
-                                note.source_id = source_id;
-                                note
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                let summary = evaluate_source_separated(&predicted, &references);
-                eprintln!(
-                    "  {:>1}-source mix {:>2}: {:<90} score {:>6.2}%  matched_pairs {:>3}  pitch {:>5.1}c  start {:>6.1}ms  end {:>6.1}ms",
-                    mix_count,
-                    mix_idx + 1,
-                    mix_label(&pairs, mix_indices),
-                    summary.total.fuzzy_score_percent(),
-                    summary.total.matched_pairs,
-                    summary.total.mean_pitch_error_semitones() * 100.0,
-                    summary.total.mean_start_error_ms(),
-                    summary.total.mean_end_error_ms(),
-                );
-                if mix_count == 2 {
-                    accumulate_note_metrics(&mut two_mix_total, &summary.total);
-                } else {
-                    accumulate_note_metrics(&mut three_mix_total, &summary.total);
-                }
-            }
-        }
-
-        let mut overall = NoteMetrics::default();
-        accumulate_note_metrics(&mut overall, &single_total);
-        accumulate_note_metrics(&mut overall, &two_mix_total);
-        accumulate_note_metrics(&mut overall, &three_mix_total);
-
-        eprintln!(
-            "aggregate single-source score: {:.2}%",
-            single_total.fuzzy_score_percent()
-        );
-        eprintln!(
-            "aggregate 2-source mix score: {:.2}%",
-            two_mix_total.fuzzy_score_percent()
-        );
-        eprintln!(
-            "aggregate 3-source mix score: {:.2}%",
-            three_mix_total.fuzzy_score_percent()
-        );
-        eprintln!(
-            "aggregate overall score:       {:.2}%",
-            overall.fuzzy_score_percent()
-        );
+        let report = build_standardized_evaluation_report(Path::new(DATASET_DIR))
+            .expect("failed to build standardized transcription report");
+        eprintln!("{}", format_evaluation_report(&report));
     }
 
     #[test]
