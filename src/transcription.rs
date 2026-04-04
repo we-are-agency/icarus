@@ -1,10 +1,9 @@
 #![allow(dead_code)]
 
 use crate::analysis::{
-    AudioFeatures, Analyser, CQT_BINS, cqt_bin_to_midi_note, midi_note_to_cqt_bin,
+    AudioFeatures, Analyser, CQT_BINS, midi_note_to_cqt_bin,
 };
 use crate::audio::FFT_SIZE;
-use crate::objects::{SoundKind, SoundObject, SoundObjectDetector};
 use midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -16,10 +15,6 @@ use std::sync::OnceLock;
 
 const DATASET_DIR: &str = "midi";
 pub const TRANSCRIPTION_HOP_SIZE: usize = FFT_SIZE / 4;
-const MAX_PITCH_CANDIDATES: usize = 6;
-const MIN_CQT_PEAK: f32 = 0.08;
-const MIN_RELATIVE_CQT_PEAK: f32 = 0.30;
-const MIN_NOTE_CONFIDENCE: f32 = 0.14;
 const NOTE_RELOCK_DISTANCE: i16 = 2;
 const NOTE_SPLIT_DISTANCE: i16 = 3;
 const NOTE_RETRIGGER_ONSET_CONFIDENCE: f32 = 0.20;
@@ -40,8 +35,6 @@ const MIN_SIMPLE_NOTES: usize = 1;
 const MAX_SIMPLE_NOTES: usize = 64;
 const PERCUSSION_KEYWORDS: &[&str] = &["hihat", "snare", "perc", "stomp", "roll", "kick", "drum"];
 const EXCLUDED_FIXTURE_KEYWORDS: &[&str] = &["choir", "vocals", "pad", "chord", "saxophone"];
-const SYNTH_SPAWN_BASE: usize = 1_000_000;
-const SYNTH_CLUSTER_BASE: usize = 2_000_000;
 const STANDARD_MIX_COUNT: usize = 10;
 const STANDARD_MIX_SIZES: &[usize] = &[2, 3];
 pub const TRANSCRIPTION_MIDI_LOW: u8 = 21;
@@ -134,16 +127,6 @@ impl InstrumentSelection {
             Self::Percussive => "Percussive",
             Self::Harmonic => "Harmonic",
             Self::PercussiveHarmonic => "PercussiveHarmonic",
-        }
-    }
-}
-
-impl From<SoundKind> for InstrumentSelection {
-    fn from(value: SoundKind) -> Self {
-        match value {
-            SoundKind::Percussive => Self::Percussive,
-            SoundKind::Harmonic => Self::Harmonic,
-            SoundKind::PercussiveHarmonic => Self::PercussiveHarmonic,
         }
     }
 }
@@ -417,13 +400,6 @@ pub struct EvalSummary {
     pub total: NoteMetrics,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PitchCandidate {
-    midi_note: u8,
-    confidence: f32,
-    bin: usize,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct MatchAssessment {
     similarity: f32,
@@ -442,21 +418,6 @@ enum AlignmentStep {
     Match,
     SkipPredicted,
     SkipReference,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveNote {
-    spawn_id: usize,
-    cluster_id: usize,
-    stream_id: usize,
-    midi_note: u8,
-    start_secs: f32,
-    last_seen_secs: f32,
-    confidence: f32,
-    brightness: f32,
-    instrument_selection: InstrumentSelection,
-    audio_energy: f32,
-    audio_energy_envelope: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -516,15 +477,6 @@ enum ActiveKind {
     Percussive,
 }
 
-impl ActiveKind {
-    fn instrument_selection(self) -> InstrumentSelection {
-        match self {
-            Self::Harmonic => InstrumentSelection::Harmonic,
-            Self::Percussive => InstrumentSelection::Percussive,
-        }
-    }
-}
-
 fn transcription_hop_secs(sample_rate: u32) -> f32 {
     TRANSCRIPTION_HOP_SIZE as f32 / sample_rate.max(1) as f32
 }
@@ -567,351 +519,6 @@ struct RealtimeTranscriber {
 
 pub struct StreamingTranscriber {
     inner: RealtimeTranscriber,
-}
-
-pub struct OnlineNoteTranscriber {
-    analyser: Analyser,
-    detector: SoundObjectDetector,
-    sample_rate: u32,
-    window: VecDeque<f32>,
-    elapsed_secs: f32,
-    active_notes: Vec<ActiveNote>,
-    finished_notes: Vec<TranscribedNote>,
-    cluster_to_stream: HashMap<usize, usize>,
-    streams: HashMap<usize, StreamState>,
-    next_stream_id: usize,
-    max_streams: usize,
-}
-
-impl OnlineNoteTranscriber {
-    pub fn new(sample_rate: u32, max_streams: usize) -> Self {
-        Self {
-            analyser: Analyser::new(sample_rate),
-            detector: SoundObjectDetector::new(),
-            sample_rate,
-            window: VecDeque::from(vec![0.0; FFT_SIZE]),
-            elapsed_secs: 0.0,
-            active_notes: Vec::new(),
-            finished_notes: Vec::new(),
-            cluster_to_stream: HashMap::new(),
-            streams: HashMap::new(),
-            next_stream_id: 0,
-            max_streams: max_streams.max(1),
-        }
-    }
-
-    pub fn process_block(&mut self, block: &[f32]) {
-        if block.is_empty() {
-            return;
-        }
-
-        for &sample in block {
-            self.window.pop_front();
-            self.window.push_back(sample);
-        }
-
-        let dt = block.len() as f32 / self.sample_rate as f32;
-        self.elapsed_secs += dt;
-        self.analyser.process(&self.window, dt);
-        self.detector.process(&self.analyser.features, dt);
-        self.update_notes(dt);
-    }
-
-    pub fn finish(mut self) -> Vec<TranscribedNote> {
-        let end_secs = self.elapsed_secs;
-        for active in self.active_notes.drain(..) {
-            self.finished_notes.push(TranscribedNote {
-                stream_id: active.stream_id,
-                midi_note: active.midi_note,
-                start_secs: active.start_secs,
-                end_secs,
-                confidence: active.confidence,
-                instrument_selection: active.instrument_selection,
-                audio_energy_hop_secs: transcription_hop_secs(self.sample_rate),
-                audio_energy_envelope: active.audio_energy_envelope,
-            });
-        }
-        self.finished_notes.sort_by(|a, b| {
-            a.start_secs
-                .partial_cmp(&b.start_secs)
-                .unwrap_or(Ordering::Equal)
-        });
-        self.finished_notes
-    }
-
-    fn update_notes(&mut self, dt: f32) {
-        let frame_end = self.elapsed_secs;
-        let frame_start = (frame_end - dt).max(0.0);
-        let features = &self.analyser.features;
-        let pitch_candidates = extract_pitch_candidates(&features.cqt);
-
-        let mut live_objects: Vec<SoundObject> = self
-            .detector
-            .live_objects
-            .iter()
-            .filter(|obj| {
-                matches!(
-                    obj.kind,
-                    SoundKind::Harmonic | SoundKind::PercussiveHarmonic
-                )
-            })
-            .cloned()
-            .collect();
-        live_objects.extend(self.synthetic_pitch_objects(&pitch_candidates, live_objects.len()));
-        live_objects.sort_by(|a, b| b.energy.partial_cmp(&a.energy).unwrap_or(Ordering::Equal));
-
-        let live_ids: HashSet<usize> = live_objects.iter().map(|obj| obj.spawn_id).collect();
-        let mut used_bins = HashSet::new();
-        let mut restarts = Vec::new();
-
-        for object in &live_objects {
-            if let Some(active_idx) = self
-                .active_notes
-                .iter()
-                .position(|note| note.spawn_id == object.spawn_id)
-            {
-                let split = self.update_existing_note(
-                    active_idx,
-                    object,
-                    &pitch_candidates,
-                    &mut used_bins,
-                    frame_start,
-                    frame_end,
-                );
-                if let Some(candidate) = split {
-                    restarts.push((object.clone(), candidate));
-                }
-                continue;
-            }
-
-            if let Some(candidate) = select_candidate_for_new(object, &pitch_candidates, &used_bins)
-            {
-                used_bins.insert(candidate.bin);
-                self.start_note_for_object(object, candidate, frame_start);
-            }
-        }
-
-        for active_idx in (0..self.active_notes.len()).rev() {
-            let active = &self.active_notes[active_idx];
-            let missing = !live_ids.contains(&active.spawn_id);
-            let stale = frame_end - active.last_seen_secs >= NOTE_RELEASE_HOLD_SECS;
-            if missing && stale {
-                self.finish_active_note(active_idx, frame_end);
-            }
-        }
-
-        for (object, candidate) in restarts {
-            if self
-                .active_notes
-                .iter()
-                .any(|note| note.spawn_id == object.spawn_id)
-            {
-                continue;
-            }
-            if used_bins.insert(candidate.bin) {
-                self.start_note_for_object(&object, candidate, frame_start);
-            }
-        }
-    }
-
-    fn synthetic_pitch_objects(
-        &self,
-        pitch_candidates: &[PitchCandidate],
-        existing_live_count: usize,
-    ) -> Vec<SoundObject> {
-        let features = &self.analyser.features;
-        if !features.analysis_ready
-            || features.rms < 0.006
-            || pitch_candidates.is_empty()
-            || (features.harmonic_confidence < 0.10 && features.pitched_stability < 0.12)
-        {
-            return Vec::new();
-        }
-
-        let target_count = if existing_live_count == 0 {
-            self.max_streams.max(1)
-        } else {
-            self.max_streams.saturating_sub(existing_live_count)
-        };
-        if target_count == 0 {
-            return Vec::new();
-        }
-
-        pitch_candidates
-            .iter()
-            .copied()
-            .filter(|candidate| candidate.confidence >= MIN_NOTE_CONFIDENCE * 0.75)
-            .take(target_count)
-            .map(|candidate| self.build_synthetic_object(candidate))
-            .collect()
-    }
-
-    fn build_synthetic_object(&self, candidate: PitchCandidate) -> SoundObject {
-        let chroma = self.analyser.features.chroma;
-        let brightness = local_pitch_brightness(&self.analyser.features.cqt, candidate.bin);
-        let midi_norm = if CQT_BINS <= 1 {
-            0.5
-        } else {
-            candidate.bin as f32 / (CQT_BINS - 1) as f32
-        };
-
-        SoundObject {
-            kind: SoundKind::Harmonic,
-            cluster_id: SYNTH_CLUSTER_BASE + candidate.bin,
-            spawn_id: SYNTH_SPAWN_BASE + candidate.bin,
-            age_secs: 0.0,
-            energy: candidate
-                .confidence
-                .max(self.analyser.features.harmonic_confidence),
-            acoustic_x: brightness,
-            acoustic_y: ((candidate.midi_note % 12) as f32 / 12.0).clamp(0.0, 1.0),
-            visual_hue: midi_norm,
-            visual_size: 0.35 + 0.45 * candidate.confidence,
-            visual_shape: 1,
-            anchor_chroma: chroma,
-            template_chroma: chroma,
-            release_timer: 0.0,
-        }
-    }
-
-    fn update_existing_note(
-        &mut self,
-        active_idx: usize,
-        object: &SoundObject,
-        pitch_candidates: &[PitchCandidate],
-        used_bins: &mut HashSet<usize>,
-        frame_start: f32,
-        frame_end: f32,
-    ) -> Option<PitchCandidate> {
-        let onset_conf = self.analyser.features.onset_confidence;
-        let candidate = {
-            let active = &self.active_notes[active_idx];
-            select_candidate_for_existing(active, object, pitch_candidates, used_bins)
-        };
-
-        if let Some(candidate) = candidate {
-            let (pitch_delta, active_start_secs, active_confidence) = {
-                let active = &self.active_notes[active_idx];
-                (
-                    semitone_distance(active.midi_note, candidate.midi_note),
-                    active.start_secs,
-                    active.confidence,
-                )
-            };
-            let should_split = pitch_delta >= NOTE_SPLIT_DISTANCE && onset_conf >= 0.18;
-            let should_retrigger = pitch_delta <= NOTE_RELOCK_DISTANCE
-                && onset_conf >= NOTE_RETRIGGER_ONSET_CONFIDENCE
-                && frame_start - active_start_secs >= NOTE_RETRIGGER_MIN_SECS
-                && candidate.confidence >= active_confidence * 0.70;
-
-            if should_split || should_retrigger {
-                self.finish_active_note(active_idx, frame_start);
-                return Some(candidate);
-            }
-
-            let active = &mut self.active_notes[active_idx];
-            used_bins.insert(candidate.bin);
-            active.last_seen_secs = frame_end;
-
-            if pitch_delta <= NOTE_RELOCK_DISTANCE
-                && candidate.confidence >= active.confidence * 0.85
-            {
-                active.midi_note = candidate.midi_note;
-            }
-            active.confidence = 0.75 * active.confidence + 0.25 * candidate.confidence;
-            active.brightness = 0.85 * active.brightness + 0.15 * object.acoustic_x;
-            active.audio_energy = candidate.confidence;
-            active.audio_energy_envelope.push(candidate.confidence.clamp(0.0, 1.0));
-        }
-
-        None
-    }
-
-    fn start_note_for_object(
-        &mut self,
-        object: &SoundObject,
-        candidate: PitchCandidate,
-        start_secs: f32,
-    ) {
-        if candidate.confidence < MIN_NOTE_CONFIDENCE {
-            return;
-        }
-
-        let stream_id =
-            self.assign_stream(object.cluster_id, candidate.midi_note, object.acoustic_x);
-        self.active_notes.push(ActiveNote {
-            spawn_id: object.spawn_id,
-            cluster_id: object.cluster_id,
-            stream_id,
-            midi_note: candidate.midi_note,
-            start_secs,
-            last_seen_secs: start_secs,
-            confidence: candidate.confidence,
-            brightness: object.acoustic_x,
-            instrument_selection: object.kind.into(),
-            audio_energy: candidate.confidence,
-            audio_energy_envelope: vec![candidate.confidence],
-        });
-    }
-
-    fn finish_active_note(&mut self, active_idx: usize, end_secs: f32) {
-        let active = self.active_notes.remove(active_idx);
-        let end_secs = end_secs.max(active.start_secs + 1e-3);
-        self.finished_notes.push(TranscribedNote {
-            stream_id: active.stream_id,
-            midi_note: active.midi_note,
-            start_secs: active.start_secs,
-            end_secs,
-            confidence: active.confidence,
-            instrument_selection: active.instrument_selection,
-            audio_energy_hop_secs: transcription_hop_secs(self.sample_rate),
-            audio_energy_envelope: active.audio_energy_envelope,
-        });
-    }
-
-    fn assign_stream(&mut self, cluster_id: usize, midi_note: u8, brightness: f32) -> usize {
-        if let Some(&stream_id) = self.cluster_to_stream.get(&cluster_id) {
-            self.update_stream(stream_id, midi_note, brightness);
-            return stream_id;
-        }
-
-        let stream_id = if self.streams.len() < self.max_streams {
-            let id = self.next_stream_id;
-            self.next_stream_id += 1;
-            self.streams.insert(
-                id,
-                StreamState {
-                    id,
-                    note_center: midi_note as f32,
-                    brightness_center: brightness,
-                    last_event_secs: self.elapsed_secs,
-                },
-            );
-            id
-        } else {
-            self.streams
-                .iter()
-                .min_by(|a, b| {
-                    stream_distance(a.1, midi_note, brightness)
-                        .partial_cmp(&stream_distance(b.1, midi_note, brightness))
-                        .unwrap_or(Ordering::Equal)
-                })
-                .map(|(&id, _)| id)
-                .unwrap()
-        };
-
-        self.cluster_to_stream.insert(cluster_id, stream_id);
-        self.update_stream(stream_id, midi_note, brightness);
-        stream_id
-    }
-
-    fn update_stream(&mut self, stream_id: usize, midi_note: u8, brightness: f32) {
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.note_center = 0.8 * stream.note_center + 0.2 * midi_note as f32;
-            stream.brightness_center = 0.85 * stream.brightness_center + 0.15 * brightness;
-            stream.last_event_secs = self.elapsed_secs;
-        }
-    }
 }
 
 impl RealtimeTranscriber {
@@ -1277,9 +884,10 @@ impl RealtimeTranscriber {
         frame_start: f32,
         frame_end: f32,
     ) {
+        let mut pending_candidates = std::mem::take(&mut self.pending_candidates);
+
         for candidate in candidates {
-            let Some((_, pending)) = self
-                .pending_candidates
+            let Some((_, pending)) = pending_candidates
                 .iter_mut()
                 .enumerate()
                 .find(|(_, pending)| {
@@ -1287,7 +895,7 @@ impl RealtimeTranscriber {
                         <= NOTE_RELOCK_DISTANCE
                 })
             else {
-                self.pending_candidates.push(PendingHarmonicCandidate {
+                pending_candidates.push(PendingHarmonicCandidate {
                     midi_note: candidate.midi_note,
                     first_seen_secs: frame_start,
                     last_seen_secs: frame_end,
@@ -1312,8 +920,8 @@ impl RealtimeTranscriber {
             pending.consecutive_hits = pending.consecutive_hits.saturating_add(1);
         }
 
-        for idx in (0..self.pending_candidates.len()).rev() {
-            let pending = &self.pending_candidates[idx];
+        let mut surviving_pending = Vec::with_capacity(pending_candidates.len());
+        for pending in pending_candidates {
             let age_secs = frame_end - pending.first_seen_secs;
             let gap_secs = frame_end - pending.last_seen_secs;
             let candidate = NoteActivation {
@@ -1333,7 +941,6 @@ impl RealtimeTranscriber {
                 || age_secs > HARMONIC_PENDING_MAX_AGE_SECS;
 
             if should_commit {
-                let pending = self.pending_candidates.remove(idx);
                 let committed = NoteActivation {
                     midi_note: pending.midi_note,
                     salience: pending.best_salience,
@@ -1352,10 +959,12 @@ impl RealtimeTranscriber {
                 continue;
             }
 
-            if should_drop {
-                self.pending_candidates.remove(idx);
+            if !should_drop {
+                surviving_pending.push(pending);
             }
         }
+
+        self.pending_candidates.extend(surviving_pending);
     }
 
     fn compute_collapse_guard(&self, stats: SalienceFrameStats) -> f32 {
@@ -2579,110 +2188,6 @@ fn reference_note_order(a: &GroundTruthNote, b: &GroundTruthNote) -> Ordering {
         })
 }
 
-fn extract_pitch_candidates(cqt: &[f32]) -> Vec<PitchCandidate> {
-    let max_mag = cqt.iter().copied().fold(0.0f32, f32::max);
-    if max_mag < MIN_CQT_PEAK {
-        return Vec::new();
-    }
-
-    let mut peaks = Vec::new();
-    for bin in 1..CQT_BINS.saturating_sub(1) {
-        let center = cqt[bin];
-        if center < MIN_CQT_PEAK || center < max_mag * MIN_RELATIVE_CQT_PEAK {
-            continue;
-        }
-        if center < cqt[bin - 1] || center < cqt[bin + 1] {
-            continue;
-        }
-
-        let local_contrast = (center - 0.5 * (cqt[bin - 1] + cqt[bin + 1])).max(0.0);
-        let confidence =
-            (0.7 * (center / max_mag) + 0.3 * (local_contrast / (center + 1e-6))).clamp(0.0, 1.0);
-        peaks.push(PitchCandidate {
-            midi_note: cqt_bin_to_midi_note(bin).expect("CQT bin should map into MIDI range"),
-            confidence,
-            bin,
-        });
-    }
-
-    if peaks.is_empty() {
-        if let Some((bin, &mag)) = cqt
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
-        {
-            if mag >= MIN_CQT_PEAK {
-                peaks.push(PitchCandidate {
-                    midi_note: cqt_bin_to_midi_note(bin)
-                        .expect("CQT bin should map into MIDI range"),
-                    confidence: 1.0,
-                    bin,
-                });
-            }
-        }
-    }
-
-    peaks.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(Ordering::Equal)
-    });
-    peaks.truncate(MAX_PITCH_CANDIDATES);
-    peaks
-}
-
-fn select_candidate_for_new(
-    object: &SoundObject,
-    candidates: &[PitchCandidate],
-    used_bins: &HashSet<usize>,
-) -> Option<PitchCandidate> {
-    let target_pitch_class = (((object.acoustic_y * 12.0).round() as i32) % 12 + 12) % 12;
-    candidates
-        .iter()
-        .copied()
-        .filter(|candidate| !used_bins.contains(&candidate.bin))
-        .max_by(|a, b| {
-            new_candidate_score(*a, target_pitch_class)
-                .partial_cmp(&new_candidate_score(*b, target_pitch_class))
-                .unwrap_or(Ordering::Equal)
-        })
-        .filter(|candidate| candidate.confidence >= MIN_NOTE_CONFIDENCE)
-}
-
-fn select_candidate_for_existing(
-    active: &ActiveNote,
-    object: &SoundObject,
-    candidates: &[PitchCandidate],
-    used_bins: &HashSet<usize>,
-) -> Option<PitchCandidate> {
-    candidates
-        .iter()
-        .copied()
-        .filter(|candidate| !used_bins.contains(&candidate.bin))
-        .max_by(|a, b| {
-            existing_candidate_score(*a, active, object)
-                .partial_cmp(&existing_candidate_score(*b, active, object))
-                .unwrap_or(Ordering::Equal)
-        })
-        .filter(|candidate| candidate.confidence >= MIN_NOTE_CONFIDENCE)
-}
-
-fn new_candidate_score(candidate: PitchCandidate, target_pitch_class: i32) -> f32 {
-    let pitch_class = (candidate.midi_note as i32).rem_euclid(12);
-    let pc_distance = circular_pitch_class_distance(pitch_class, target_pitch_class) as f32;
-    candidate.confidence - 0.08 * pc_distance
-}
-
-fn existing_candidate_score(
-    candidate: PitchCandidate,
-    active: &ActiveNote,
-    object: &SoundObject,
-) -> f32 {
-    let note_distance = semitone_distance(active.midi_note, candidate.midi_note) as f32;
-    let brightness_distance = (active.brightness - object.acoustic_x).abs();
-    candidate.confidence - note_distance / STREAM_NOTE_DISTANCE_NORM - 0.20 * brightness_distance
-}
-
 fn stream_distance(stream: &StreamState, midi_note: u8, brightness: f32) -> f32 {
     ((stream.note_center - midi_note as f32).abs() / STREAM_NOTE_DISTANCE_NORM)
         + (stream.brightness_center - brightness).abs()
@@ -2690,11 +2195,6 @@ fn stream_distance(stream: &StreamState, midi_note: u8, brightness: f32) -> f32 
 
 fn semitone_distance(a: u8, b: u8) -> i16 {
     (a as i16 - b as i16).abs()
-}
-
-fn circular_pitch_class_distance(a: i32, b: i32) -> i32 {
-    let d = (a - b).abs();
-    d.min(12 - d)
 }
 
 fn ratio(numerator: usize, denominator: usize) -> f32 {
@@ -2753,27 +2253,6 @@ fn find_global_tempo(smf: &Smf<'_>) -> Option<u32> {
         }
     }
     None
-}
-
-fn local_pitch_brightness(cqt: &[f32], center_bin: usize) -> f32 {
-    if cqt.is_empty() {
-        return 0.5;
-    }
-
-    let start = center_bin.saturating_sub(4);
-    let end = (center_bin + 4).min(cqt.len() - 1);
-    let mut weighted_sum = 0.0;
-    let mut total = 0.0;
-    for (idx, &mag) in cqt.iter().enumerate().take(end + 1).skip(start) {
-        weighted_sum += mag * idx as f32;
-        total += mag;
-    }
-
-    if total <= 1e-6 || cqt.len() == 1 {
-        center_bin as f32 / (cqt.len().saturating_sub(1).max(1)) as f32
-    } else {
-        (weighted_sum / total / (cqt.len() - 1) as f32).clamp(0.0, 1.0)
-    }
 }
 
 fn max_polyphony(notes: &[GroundTruthNote]) -> usize {
@@ -3627,6 +3106,47 @@ mod tests {
 
         assert_eq!(transcriber.active_notes.len(), 1);
         assert_eq!(transcriber.active_notes[0].midi_note, 62);
+    }
+
+    #[test]
+    fn committing_pending_note_can_prune_neighbors_without_panicking() {
+        let mut transcriber = RealtimeTranscriber::new(44_100, 4);
+        transcriber.analyser.features.onset_confidence = 0.16;
+        transcriber.analyser.features.harmonic_confidence = 0.24;
+        transcriber.analyser.features.pitched_stability = 0.24;
+        transcriber.pending_candidates = vec![
+            PendingHarmonicCandidate {
+                midi_note: 60,
+                first_seen_secs: 0.0,
+                last_seen_secs: 0.024,
+                best_salience: 0.22,
+                best_absolute_strength: 0.22,
+                brightness: 0.52,
+                local_contrast: 0.022,
+                consecutive_hits: HARMONIC_PENDING_CONFIRM_HITS,
+                register: pitch_register(60),
+            },
+            PendingHarmonicCandidate {
+                midi_note: 61,
+                first_seen_secs: 0.0,
+                last_seen_secs: 0.024,
+                best_salience: 0.23,
+                best_absolute_strength: 0.23,
+                brightness: 0.54,
+                local_contrast: 0.023,
+                consecutive_hits: HARMONIC_PENDING_CONFIRM_HITS,
+                register: pitch_register(61),
+            },
+        ];
+
+        transcriber.update_pending_harmonic_candidates(&[], 0.024, 0.036);
+
+        assert_eq!(transcriber.active_notes.len(), 1);
+        assert!(transcriber.pending_candidates.is_empty());
+        assert!(matches!(
+            transcriber.active_notes[0].midi_note,
+            60 | 61
+        ));
     }
 
     #[test]

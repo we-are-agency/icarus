@@ -32,14 +32,6 @@ It is responsible for deriving the low-level evidence the rest of the app uses, 
 
 Think of this layer as "what does the audio look like right now?"
 
-### Sound Objects
-
-[`src/objects.rs`](./src/objects.rs) contains the sound-object detector.
-
-This is the older or parallel abstraction for turning analysis into object-like events such as percussive, harmonic, or hybrid sound entities. It is still an important part of the repo and still has tests, but the main visualization path is now driven by the transcription system rather than by rendering sound objects directly.
-
-Think of this layer as "what kinds of sounding things seem to exist right now?"
-
 ### Transcriber
 
 [`src/transcription.rs`](./src/transcription.rs) is the current note-oriented interpretation layer.
@@ -82,7 +74,7 @@ Current selections are:
 2. `Harmonic`
 3. `PercussiveHarmonic`
 
-Right now these labels are close to the existing `SoundKind` categories, but that is a current implementation choice, not a permanent rule. The name "instrument selection" is meant to stay broader than the underlying detection taxonomy.
+Right now these labels reflect the transcriber's current broad families of output, but that is an implementation choice, not a permanent rule. The name "instrument selection" is meant to stay broader than any single detection taxonomy.
 
 Think of this as "which family of notes should this event belong to for display and control purposes?"
 
@@ -156,7 +148,6 @@ Top-level pieces you will usually care about:
 
 - [`src/analysis.rs`](./src/analysis.rs): spectral / feature analysis
 - [`src/audio.rs`](./src/audio.rs): realtime audio capture
-- [`src/objects.rs`](./src/objects.rs): sound-object detector
 - [`src/transcription.rs`](./src/transcription.rs): online transcription and evaluation
 - [`src/midi_layer.rs`](./src/midi_layer.rs): note-history and visualization bridge
 - [`src/main.rs`](./src/main.rs): Nannou visualizer app
@@ -168,7 +159,6 @@ Top-level pieces you will usually care about:
 
 This repo is not a neatly isolated library with one perfectly finished pipeline. Expect a few shenanigans:
 
-- overlapping abstractions: sound objects and note transcription coexist
 - realtime and evaluation concerns living close together in the same modules
 - visualizer-specific state that exists mainly to make live rendering easier
 - experimental heuristics around onset handling, pitch tracking, note birth, and note continuation

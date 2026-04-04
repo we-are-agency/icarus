@@ -183,11 +183,14 @@ fn update(_app: &App, model: &mut Model, _update: Update) {
     // Rebuild CQT spectrogram pixel buffer
     let pixels = &mut model.spectrogram_pixels;
     pixels.fill(0);
-    for (t, frame) in model.transcriber.cqt_history().iter().enumerate() {
+    let cqt_history = model.transcriber.cqt_history();
+    let cqt_x_offset = CQT_HISTORY.saturating_sub(cqt_history.len());
+    for (t, frame) in cqt_history.iter().enumerate() {
+        let x = cqt_x_offset + t;
         for (b, &mag) in frame.iter().enumerate() {
             // Flip Y: bin 0 = low freq = bottom of image = high pixel row
             let y = CQT_BINS - 1 - b;
-            let idx = (y * CQT_HISTORY + t) * 4;
+            let idx = (y * CQT_HISTORY + x) * 4;
             let [r, g, bl, a] = spectrogram_rgba(mag);
             pixels[idx] = r;
             pixels[idx + 1] = g;
@@ -199,11 +202,14 @@ fn update(_app: &App, model: &mut Model, _update: Update) {
     // Rebuild STFT spectrogram pixel buffer
     let fft_pixels = &mut model.fft_spectrogram_pixels;
     fft_pixels.fill(0);
-    for (t, frame) in model.transcriber.fft_history().iter().enumerate() {
+    let fft_history = model.transcriber.fft_history();
+    let fft_x_offset = FFT_HISTORY.saturating_sub(fft_history.len());
+    for (t, frame) in fft_history.iter().enumerate() {
+        let x = fft_x_offset + t;
         for (b, &mag) in frame.iter().enumerate() {
             // Flip Y: bin 0 = low freq = bottom = high pixel row
             let y = FFT_DISPLAY_BINS - 1 - b;
-            let idx = (y * FFT_HISTORY + t) * 4;
+            let idx = (y * FFT_HISTORY + x) * 4;
             let [r, g, bl, a] = spectrogram_rgba(mag);
             fft_pixels[idx] = r;
             fft_pixels[idx + 1] = g;
