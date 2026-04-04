@@ -3,23 +3,23 @@ use nannou::prelude::*;
 use icarus::analysis::{CQT_BINS, CQT_HISTORY, FFT_DISPLAY_BINS, FFT_HISTORY};
 use icarus::audio::{AudioCapture, FFT_SIZE};
 use icarus::midi_layer::MidiLayer;
-use icarus::transcription::{StreamingTranscriber, TRANSCRIPTION_HOP_SIZE};
+use icarus::transcription::{InstrumentSelection, StreamingTranscriber, TRANSCRIPTION_HOP_SIZE};
 use std::collections::VecDeque;
 
 const MENU_BAR_H: f32 = 56.0;
 const MENU_ITEM_GAP: f32 = 28.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LayerKind {
-    Analysis,
-    Harmonics,
-    Percussion,
+enum VisualLayer {
+    Notes,
 }
 
 struct LayerMenuItem {
-    layers: Vec<LayerKind>,
+    instrument_selection: InstrumentSelection,
+    layers: Vec<VisualLayer>,
     label: &'static str,
     active: bool,
+    rms: f32,
 }
 
 struct Model {
@@ -94,19 +94,25 @@ fn model(app: &App) -> Model {
         midi: MidiLayer::new(sample_rate),
         layer_menu: vec![
             LayerMenuItem {
-                layers: vec![LayerKind::Analysis],
-                label: "Analysis",
+                instrument_selection: InstrumentSelection::Percussive,
+                layers: vec![VisualLayer::Notes],
+                label: "Percussive",
                 active: true,
+                rms: 0.0,
             },
             LayerMenuItem {
-                layers: vec![LayerKind::Harmonics],
-                label: "Harmonics",
+                instrument_selection: InstrumentSelection::Harmonic,
+                layers: vec![VisualLayer::Notes],
+                label: "Harmonic",
                 active: true,
+                rms: 0.0,
             },
             LayerMenuItem {
-                layers: vec![LayerKind::Percussion],
-                label: "Percussion",
+                instrument_selection: InstrumentSelection::PercussiveHarmonic,
+                layers: vec![VisualLayer::Notes],
+                label: "PercussiveHarmonic",
                 active: true,
+                rms: 0.0,
             },
         ],
         selected_group: 0,
@@ -155,6 +161,9 @@ fn update(_app: &App, model: &mut Model, _update: Update) {
         &active_notes,
         model.transcriber.elapsed_secs(),
     );
+    for group in &mut model.layer_menu {
+        group.rms = model.midi.group_rms(group.instrument_selection);
+    }
 
     // Beat flash decay
     model.kick_flash *= 0.82;
@@ -238,6 +247,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
 
     let win = app.window_rect();
     draw_menu_layer(&draw, win, model);
+    draw_analysis_scaffold(&draw, model, &frame, win);
 
     for group in &model.layer_menu {
         if !group.active {
@@ -246,8 +256,9 @@ fn view(app: &App, model: &Model, frame: Frame) {
 
         for layer in &group.layers {
             match layer {
-                LayerKind::Analysis => draw_analysis_layer(&draw, model, &frame, win),
-                LayerKind::Harmonics | LayerKind::Percussion => {}
+                VisualLayer::Notes => {
+                    draw_instrument_selection_notes(&draw, model, win, group.instrument_selection)
+                }
             }
         }
     }
@@ -276,32 +287,37 @@ fn draw_menu_layer(draw: &Draw, win: Rect, model: &Model) {
         let text_alpha = if is_selected { 0.98 } else { 0.68 };
         let indicator_y = win.top() - MENU_BAR_H + 10.0;
         let indicator_h = 8.0;
+        let charcoal = 0.18;
+        let brightness = if item.active {
+            charcoal + (1.0 - charcoal) * item.rms.clamp(0.0, 1.0)
+        } else {
+            charcoal
+        };
+        let indicator_alpha = if item.active { 0.95 } else { 0.65 };
 
         draw.text(item.label)
             .x_y(item_x, win.top() - 24.0)
             .font_size(9)
             .color(rgba(1.0, 1.0, 1.0, text_alpha));
 
-        if item.active {
-            draw.rect()
-                .x_y(item_x, indicator_y)
-                .w_h(estimated_w, indicator_h)
-                .color(rgba(0.18, 0.19, 0.21, 0.90));
+        draw.rect()
+            .x_y(item_x, indicator_y)
+            .w_h(estimated_w, indicator_h)
+            .color(rgba(brightness, brightness, brightness, indicator_alpha));
 
-            if is_selected {
-                draw.line()
-                    .start(pt2(item_x - estimated_w * 0.5, indicator_y - indicator_h * 0.5))
-                    .end(pt2(item_x + estimated_w * 0.5, indicator_y - indicator_h * 0.5))
-                    .color(rgba(1.0, 1.0, 1.0, 0.95))
-                    .weight(2.0);
-            }
+        if item.active && is_selected {
+            draw.line()
+                .start(pt2(item_x - estimated_w * 0.5, indicator_y - indicator_h * 0.5))
+                .end(pt2(item_x + estimated_w * 0.5, indicator_y - indicator_h * 0.5))
+                .color(rgba(1.0, 1.0, 1.0, 0.95))
+                .weight(2.0);
         }
 
         cursor_x += estimated_w + MENU_ITEM_GAP;
     }
 }
 
-fn draw_analysis_layer(draw: &Draw, model: &Model, frame: &Frame, win: Rect) {
+fn draw_analysis_scaffold(draw: &Draw, model: &Model, frame: &Frame, win: Rect) {
     let f = model.transcriber.features();
     let content_top = win.top() - MENU_BAR_H - 10.0;
     let spec_bottom = win.bottom() + win.h() * 0.18;
@@ -412,29 +428,6 @@ fn draw_analysis_layer(draw: &Draw, model: &Model, frame: &Frame, win: Rect) {
                 .color(rgba(1.0, 1.0, 1.0, 0.06))
                 .weight(1.0);
             grid_t += grid_secs;
-        }
-
-        for note in midi.visible_notes() {
-            let y = midi_pitch_y(note.midi_note, note_min, note_max, panel_y0, panel_y1);
-            let x_start = (note_x0 + (note.start_secs - t_offset) / history * note_w)
-                .clamp(note_x0, note_x0 + note_w);
-            let x_end = (note_x0 + (note.end_secs - t_offset) / history * note_w)
-                .clamp(note_x0, note_x0 + note_w);
-            let block_w = (x_end - x_start).max(2.0);
-            let alpha = 0.28 + 0.60 * note.confidence;
-            let lit = if note.alive { 0.64 } else { 0.54 };
-
-            draw.rect()
-                .x_y(x_start + block_w * 0.5, y)
-                .w_h(block_w, lane_h * 0.82)
-                .color(hsla(note.hue, 0.88, lit, alpha));
-
-            if note.alive {
-                draw.rect()
-                    .x_y(x_end - 1.0, y)
-                    .w_h(2.0, lane_h.max(4.0))
-                    .color(rgba(1.0, 1.0, 1.0, 0.78));
-            }
         }
 
         draw.line()
@@ -568,6 +561,54 @@ fn draw_analysis_layer(draw: &Draw, model: &Model, frame: &Frame, win: Rect) {
         }
     }
 
+}
+
+fn draw_instrument_selection_notes(
+    draw: &Draw,
+    model: &Model,
+    win: Rect,
+    instrument_selection: InstrumentSelection,
+) {
+    let midi = &model.midi;
+    let history = midi.history_secs().max(1e-3);
+    let now = midi.elapsed_secs();
+    let t_offset = now - history;
+    let content_top = win.top() - MENU_BAR_H - 10.0;
+    let spec_bottom = win.bottom() + win.h() * 0.18;
+    let spec_h = (content_top - spec_bottom).max(80.0);
+    let panel_x0 = win.left();
+    let panel_y0 = spec_bottom;
+    let panel_y1 = spec_bottom + spec_h;
+    let label_w = 48.0_f32;
+    let note_x0 = panel_x0 + label_w;
+    let note_w = win.w() - label_w;
+    let note_min = midi.note_min();
+    let note_max = midi.note_max();
+    let note_span = (note_max - note_min + 1) as f32;
+    let lane_h = (spec_h / note_span).max(2.0);
+
+    for note in midi.visible_notes_for_selection(Some(instrument_selection)) {
+        let y = midi_pitch_y(note.midi_note, note_min, note_max, panel_y0, panel_y1);
+        let x_start = (note_x0 + (note.start_secs - t_offset) / history * note_w)
+            .clamp(note_x0, note_x0 + note_w);
+        let x_end = (note_x0 + (note.end_secs - t_offset) / history * note_w)
+            .clamp(note_x0, note_x0 + note_w);
+        let block_w = (x_end - x_start).max(2.0);
+        let alpha = 0.28 + 0.60 * note.confidence;
+        let lit = if note.alive { 0.64 } else { 0.54 };
+
+        draw.rect()
+            .x_y(x_start + block_w * 0.5, y)
+            .w_h(block_w, lane_h * 0.82)
+            .color(hsla(note.hue, 0.88, lit, alpha));
+
+        if note.alive {
+            draw.rect()
+                .x_y(x_end - 1.0, y)
+                .w_h(2.0, lane_h.max(4.0))
+                .color(rgba(1.0, 1.0, 1.0, 0.78));
+        }
+    }
 }
 
 fn midi_pitch_y(midi_note: u8, note_min: u8, note_max: u8, panel_y0: f32, panel_y1: f32) -> f32 {

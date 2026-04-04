@@ -15,6 +15,9 @@ struct NoteEvent {
     confidence: f32,
     alive: bool,
     instrument_selection: InstrumentSelection,
+    audio_energy: f32,
+    audio_energy_hop_secs: f32,
+    audio_energy_envelope: Vec<f32>,
 }
 
 pub struct DrawNote {
@@ -26,6 +29,7 @@ pub struct DrawNote {
     pub confidence: f32,
     pub alive: bool,
     pub instrument_selection: InstrumentSelection,
+    pub audio_energy: f32,
 }
 
 pub struct MidiLayer {
@@ -105,7 +109,7 @@ impl MidiLayer {
             {
                 continue;
             }
-            notes.push(note.as_draw_note());
+            notes.push(note.as_draw_note_at(self.elapsed_secs));
         }
 
         for note in self.active_notes.values() {
@@ -114,7 +118,7 @@ impl MidiLayer {
             {
                 continue;
             }
-            notes.push(note.as_draw_note());
+            notes.push(note.as_draw_note_at(self.elapsed_secs));
         }
 
         notes.sort_by(|a, b| {
@@ -135,7 +139,8 @@ impl MidiLayer {
                 && note.start_secs <= self.elapsed_secs
                 && note.end_secs >= self.elapsed_secs
             {
-                sum_squares += note.confidence * note.confidence;
+                let energy = note.current_audio_energy(self.elapsed_secs);
+                sum_squares += energy * energy;
                 count += 1;
             }
         }
@@ -145,7 +150,8 @@ impl MidiLayer {
                 && note.start_secs <= self.elapsed_secs
                 && note.end_secs >= self.elapsed_secs
             {
-                sum_squares += note.confidence * note.confidence;
+                let energy = note.current_audio_energy(self.elapsed_secs);
+                sum_squares += energy * energy;
                 count += 1;
             }
         }
@@ -182,6 +188,9 @@ impl NoteEvent {
             confidence: note.note.confidence,
             alive: false,
             instrument_selection: note.note.instrument_selection,
+            audio_energy: note.note.audio_energy_envelope.last().copied().unwrap_or(0.0),
+            audio_energy_hop_secs: note.note.audio_energy_hop_secs,
+            audio_energy_envelope: note.note.audio_energy_envelope.clone(),
         }
     }
 
@@ -195,10 +204,13 @@ impl NoteEvent {
             confidence: note.confidence,
             alive: true,
             instrument_selection: note.instrument_selection,
+            audio_energy: note.audio_energy,
+            audio_energy_hop_secs: 0.0,
+            audio_energy_envelope: Vec::new(),
         }
     }
 
-    fn as_draw_note(&self) -> DrawNote {
+    fn as_draw_note_at(&self, elapsed_secs: f32) -> DrawNote {
         DrawNote {
             id: self.id,
             midi_note: self.midi_note,
@@ -208,7 +220,18 @@ impl NoteEvent {
             confidence: self.confidence.clamp(0.0, 1.0),
             alive: self.alive,
             instrument_selection: self.instrument_selection,
+            audio_energy: self.current_audio_energy(elapsed_secs),
         }
+    }
+
+    fn current_audio_energy(&self, elapsed_secs: f32) -> f32 {
+        if self.alive || self.audio_energy_envelope.is_empty() || self.audio_energy_hop_secs <= 0.0 {
+            return self.audio_energy.clamp(0.0, 1.0);
+        }
+
+        let offset_secs = (elapsed_secs - self.start_secs).clamp(0.0, self.end_secs - self.start_secs);
+        let idx = (offset_secs / self.audio_energy_hop_secs).floor() as usize;
+        self.audio_energy_envelope[idx.min(self.audio_energy_envelope.len() - 1)].clamp(0.0, 1.0)
     }
 }
 

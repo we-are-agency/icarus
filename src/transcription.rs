@@ -156,6 +156,8 @@ pub struct TranscribedNote {
     pub end_secs: f32,
     pub confidence: f32,
     pub instrument_selection: InstrumentSelection,
+    pub audio_energy_hop_secs: f32,
+    pub audio_energy_envelope: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +175,7 @@ pub struct ActiveTranscribedNote {
     pub end_secs: f32,
     pub confidence: f32,
     pub instrument_selection: InstrumentSelection,
+    pub audio_energy: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -452,6 +455,8 @@ struct ActiveNote {
     confidence: f32,
     brightness: f32,
     instrument_selection: InstrumentSelection,
+    audio_energy: f32,
+    audio_energy_envelope: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -520,6 +525,10 @@ impl ActiveKind {
     }
 }
 
+fn transcription_hop_secs(sample_rate: u32) -> f32 {
+    TRANSCRIPTION_HOP_SIZE as f32 / sample_rate.max(1) as f32
+}
+
 #[derive(Debug, Clone)]
 struct RealtimeActiveNote {
     id: usize,
@@ -530,6 +539,9 @@ struct RealtimeActiveNote {
     confidence: f32,
     brightness: f32,
     kind: ActiveKind,
+    instrument_selection: InstrumentSelection,
+    audio_energy: f32,
+    audio_energy_envelope: Vec<f32>,
 }
 
 struct RealtimeTranscriber {
@@ -615,6 +627,8 @@ impl OnlineNoteTranscriber {
                 end_secs,
                 confidence: active.confidence,
                 instrument_selection: active.instrument_selection,
+                audio_energy_hop_secs: transcription_hop_secs(self.sample_rate),
+                audio_energy_envelope: active.audio_energy_envelope,
             });
         }
         self.finished_notes.sort_by(|a, b| {
@@ -806,6 +820,8 @@ impl OnlineNoteTranscriber {
             }
             active.confidence = 0.75 * active.confidence + 0.25 * candidate.confidence;
             active.brightness = 0.85 * active.brightness + 0.15 * object.acoustic_x;
+            active.audio_energy = candidate.confidence;
+            active.audio_energy_envelope.push(candidate.confidence.clamp(0.0, 1.0));
         }
 
         None
@@ -833,6 +849,8 @@ impl OnlineNoteTranscriber {
             confidence: candidate.confidence,
             brightness: object.acoustic_x,
             instrument_selection: object.kind.into(),
+            audio_energy: candidate.confidence,
+            audio_energy_envelope: vec![candidate.confidence],
         });
     }
 
@@ -846,6 +864,8 @@ impl OnlineNoteTranscriber {
             end_secs,
             confidence: active.confidence,
             instrument_selection: active.instrument_selection,
+            audio_energy_hop_secs: transcription_hop_secs(self.sample_rate),
+            audio_energy_envelope: active.audio_energy_envelope,
         });
     }
 
@@ -945,7 +965,8 @@ impl RealtimeTranscriber {
                 note.start_secs,
                 end_secs.max(note.start_secs + 1e-3),
                 note.confidence,
-                note.kind.instrument_selection(),
+                note.instrument_selection,
+                note.audio_energy_envelope,
             );
         }
         self.finished_notes
@@ -962,6 +983,7 @@ impl RealtimeTranscriber {
         end_secs: f32,
         confidence: f32,
         instrument_selection: InstrumentSelection,
+        audio_energy_envelope: Vec<f32>,
     ) {
         self.finished_notes.push(CompletedTranscribedNote {
             id,
@@ -972,6 +994,8 @@ impl RealtimeTranscriber {
                 end_secs,
                 confidence,
                 instrument_selection,
+                audio_energy_hop_secs: transcription_hop_secs(self.sample_rate),
+                audio_energy_envelope,
             },
         });
     }
@@ -1005,9 +1029,33 @@ impl RealtimeTranscriber {
             self.max_streams,
         );
         self.update_harmonic_notes(&candidates, frame_start, frame_end);
+        self.sample_active_note_audio_energy(&note_evidence.absolute_strength);
         self.emit_percussive_notes(frame_start);
         self.release_stale_notes(frame_end);
         self.update_salience_references(frame_stats);
+    }
+
+    fn sample_active_note_audio_energy(&mut self, absolute_strength: &[f32; 128]) {
+        for note in &mut self.active_notes {
+            if note.kind != ActiveKind::Harmonic {
+                continue;
+            }
+            let energy = absolute_strength[note.midi_note as usize].clamp(0.0, 1.0);
+            note.audio_energy = energy;
+            note.audio_energy_envelope.push(energy);
+        }
+    }
+
+    fn current_harmonic_instrument_selection(&self) -> InstrumentSelection {
+        let features = &self.analyser.features;
+        if features.harmonic_confidence >= 0.20
+            && features.percussive_confidence >= 0.20
+            && features.onset_confidence >= 0.10
+        {
+            InstrumentSelection::PercussiveHarmonic
+        } else {
+            InstrumentSelection::Harmonic
+        }
     }
 
     fn update_note_energy_ema(&mut self, note_strength: &[f32; 128]) {
@@ -1367,6 +1415,9 @@ impl RealtimeTranscriber {
             confidence: candidate.salience,
             brightness: candidate.brightness,
             kind: ActiveKind::Harmonic,
+            instrument_selection: self.current_harmonic_instrument_selection(),
+            audio_energy: 0.0,
+            audio_energy_envelope: Vec::new(),
         });
         self.pending_candidates.retain(|pending| {
             semitone_distance(pending.midi_note, candidate.midi_note) > NOTE_RELOCK_DISTANCE
@@ -1454,6 +1505,7 @@ impl RealtimeTranscriber {
             start_secs + DRUM_NOTE_LENGTH_SECS,
             self.analyser.features.percussive_confidence.max(0.3),
             InstrumentSelection::Percussive,
+            vec![self.analyser.features.percussive_confidence.max(0.3)],
         );
         self.update_stream(stream_id, midi_note, brightness);
         self.drum_cooldowns[class_idx] = DRUM_COOLDOWN_SECS;
@@ -1484,7 +1536,8 @@ impl RealtimeTranscriber {
             note.start_secs,
             end_secs.max(note.start_secs + HARMONIC_MIN_NOTE_SECS),
             note.confidence,
-            note.kind.instrument_selection(),
+            note.instrument_selection,
+            note.audio_energy_envelope,
         );
     }
 
@@ -1591,7 +1644,8 @@ impl StreamingTranscriber {
                 start_secs: note.start_secs,
                 end_secs: self.inner.elapsed_secs.max(note.start_secs + 1e-3),
                 confidence: note.confidence,
-                instrument_selection: note.kind.instrument_selection(),
+                instrument_selection: note.instrument_selection,
+                audio_energy: note.audio_energy,
             })
             .collect()
     }
@@ -3240,6 +3294,8 @@ mod tests {
             end_secs: 1.5,
             confidence: 1.0,
             instrument_selection: InstrumentSelection::Harmonic,
+            audio_energy_hop_secs: 0.0,
+            audio_energy_envelope: Vec::new(),
         }];
         let reference = vec![GroundTruthNote {
             source_id: 0,
@@ -3263,6 +3319,8 @@ mod tests {
             end_secs: 1.58,
             confidence: 1.0,
             instrument_selection: InstrumentSelection::Harmonic,
+            audio_energy_hop_secs: 0.0,
+            audio_energy_envelope: Vec::new(),
         }];
         let reference = vec![GroundTruthNote {
             source_id: 0,
@@ -3302,6 +3360,8 @@ mod tests {
                 end_secs: 0.5,
                 confidence: 1.0,
                 instrument_selection: InstrumentSelection::Harmonic,
+                audio_energy_hop_secs: 0.0,
+                audio_energy_envelope: Vec::new(),
             },
             TranscribedNote {
                 stream_id: 0,
@@ -3310,6 +3370,8 @@ mod tests {
                 end_secs: 1.10,
                 confidence: 0.8,
                 instrument_selection: InstrumentSelection::Harmonic,
+                audio_energy_hop_secs: 0.0,
+                audio_energy_envelope: Vec::new(),
             },
             TranscribedNote {
                 stream_id: 0,
@@ -3318,6 +3380,8 @@ mod tests {
                 end_secs: 2.2,
                 confidence: 0.6,
                 instrument_selection: InstrumentSelection::Harmonic,
+                audio_energy_hop_secs: 0.0,
+                audio_energy_envelope: Vec::new(),
             },
         ];
 
@@ -3507,6 +3571,9 @@ mod tests {
             confidence: 0.22,
             brightness: 0.56,
             kind: ActiveKind::Harmonic,
+            instrument_selection: InstrumentSelection::Harmonic,
+            audio_energy: 0.22,
+            audio_energy_envelope: vec![0.22],
         });
         transcriber.next_note_id = 1;
 
@@ -3542,6 +3609,9 @@ mod tests {
             confidence: 0.20,
             brightness: 0.54,
             kind: ActiveKind::Harmonic,
+            instrument_selection: InstrumentSelection::Harmonic,
+            audio_energy: 0.20,
+            audio_energy_envelope: vec![0.20],
         });
 
         let candidate = NoteActivation {
