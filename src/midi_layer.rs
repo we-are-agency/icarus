@@ -1,186 +1,170 @@
-use crate::analysis::FFT_HISTORY;
-use crate::objects::{SoundKind, SoundObject};
+use crate::analysis::CQT_HISTORY;
+use crate::transcription::{
+    ActiveTranscribedNote, CompletedTranscribedNote, TRANSCRIPTION_HOP_SIZE,
+    TRANSCRIPTION_MIDI_HIGH, TRANSCRIPTION_MIDI_LOW,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-const MAX_TRACKS: usize = 16;
-/// Harmonic/PH notes extend while energy stays above this (sustain tracking).
-const HARM_NOTE_THRESHOLD: f32 = 0.10;
-/// Percussive notes extend only while energy is high — makes tick width proportional
-/// to hit strength. Minimum onset_strength is 0.5, so quiet ticks → near-zero width.
-const PERC_NOTE_THRESHOLD: f32 = 0.55;
-
+#[derive(Debug, Clone)]
 struct NoteEvent {
-    cluster_id: usize,
-    spawn_id: usize,
-    kind: SoundKind,
-    hue: f32,
+    id: usize,
+    stream_id: usize,
+    midi_note: u8,
     start_secs: f32,
     end_secs: f32,
+    confidence: f32,
     alive: bool,
 }
 
-/// One lane in the MIDI panel.
-pub struct TrackInfo {
-    pub cluster_id: usize,
-    pub kind: SoundKind,
-    pub hue: f32,
-}
-
-/// Note ready for rendering with its lane resolved.
 pub struct DrawNote {
-    pub track_idx: usize,
+    pub id: usize,
+    pub midi_note: u8,
     pub hue: f32,
-    pub kind: SoundKind,
     pub start_secs: f32,
     pub end_secs: f32,
+    pub confidence: f32,
     pub alive: bool,
 }
 
-fn kind_group(k: SoundKind) -> u8 {
-    match k {
-        SoundKind::Percussive         => 0,
-        SoundKind::PercussiveHarmonic => 1,
-        SoundKind::Harmonic           => 2,
-    }
-}
-
 pub struct MidiLayer {
-    notes: VecDeque<NoteEvent>,
-    live_spawn_ids: HashSet<usize>,
-    /// Track lanes sorted by kind group (Perc → PH → Harm), then by first appearance.
-    pub tracks: Vec<TrackInfo>,
-    pub elapsed_secs: f32,
-    /// Exponential moving average of frame dt — used to match history window to spectrogram speed.
-    smooth_dt: f32,
+    finished_notes: VecDeque<NoteEvent>,
+    active_notes: HashMap<usize, NoteEvent>,
+    elapsed_secs: f32,
+    history_secs: f32,
 }
 
 impl MidiLayer {
-    pub fn new() -> Self {
+    pub fn new(sample_rate: u32) -> Self {
+        let hop_secs = TRANSCRIPTION_HOP_SIZE as f32 / sample_rate.max(1) as f32;
         Self {
-            notes: VecDeque::new(),
-            live_spawn_ids: HashSet::new(),
-            tracks: Vec::new(),
+            finished_notes: VecDeque::new(),
+            active_notes: HashMap::new(),
             elapsed_secs: 0.0,
-            smooth_dt: 1.0 / 43.0,  // assume ~43fps initially
+            history_secs: CQT_HISTORY as f32 * hop_secs,
         }
     }
 
-    pub fn clear_all(&mut self) {
-        self.notes.clear();
-        self.live_spawn_ids.clear();
-        self.tracks.clear();
-    }
-
-    /// History window in seconds — matches the spectrogram's time span (FFT_HISTORY frames).
     pub fn history_secs(&self) -> f32 {
-        FFT_HISTORY as f32 * self.smooth_dt
+        self.history_secs
     }
 
-    pub fn update(&mut self, objects: &[SoundObject], dt: f32) {
-        self.elapsed_secs += dt;
-        self.smooth_dt = self.smooth_dt * 0.97 + dt * 0.03;
-        let now = self.elapsed_secs;
-        let history = self.history_secs();
+    pub fn elapsed_secs(&self) -> f32 {
+        self.elapsed_secs
+    }
 
-        let current_ids: HashSet<usize> = objects.iter().map(|o| o.spawn_id).collect();
-        let energies: HashMap<usize, f32> = objects.iter().map(|o| (o.spawn_id, o.energy)).collect();
+    pub fn note_min(&self) -> u8 {
+        TRANSCRIPTION_MIDI_LOW
+    }
 
-        // Births
-        for obj in objects {
-            if self.live_spawn_ids.contains(&obj.spawn_id) {
-                // Update hue / kind on existing track (e.g. Perc → PH upgrade)
-                if let Some(t) = self.tracks.iter_mut().find(|t| t.cluster_id == obj.cluster_id) {
-                    t.hue = obj.visual_hue;
-                    if t.kind != obj.kind {
-                        t.kind = obj.kind;
-                        self.tracks.sort_by_key(|t| kind_group(t.kind));
-                    }
-                }
+    pub fn note_max(&self) -> u8 {
+        TRANSCRIPTION_MIDI_HIGH
+    }
+
+    pub fn update(
+        &mut self,
+        finished: &[CompletedTranscribedNote],
+        active: &[ActiveTranscribedNote],
+        elapsed_secs: f32,
+    ) {
+        self.elapsed_secs = elapsed_secs;
+
+        for completed in finished {
+            self.active_notes.remove(&completed.id);
+            self.finished_notes
+                .push_back(NoteEvent::from_completed(completed));
+        }
+
+        let live_ids: HashSet<usize> = active.iter().map(|note| note.id).collect();
+        self.active_notes.retain(|id, _| live_ids.contains(id));
+
+        for active_note in active {
+            self.active_notes
+                .insert(active_note.id, NoteEvent::from_active(active_note));
+        }
+
+        self.prune_history();
+    }
+
+    pub fn visible_notes(&self) -> Vec<DrawNote> {
+        let cutoff = self.elapsed_secs - self.history_secs;
+        let mut notes =
+            Vec::with_capacity(self.finished_notes.len().saturating_add(self.active_notes.len()));
+
+        for note in &self.finished_notes {
+            if note.end_secs < cutoff {
                 continue;
             }
-
-            // New spawn_id — register track if cluster not yet known
-            if !self.tracks.iter().any(|t| t.cluster_id == obj.cluster_id) {
-                if self.tracks.len() >= MAX_TRACKS {
-                    self.tracks.remove(0);
-                }
-                self.tracks.push(TrackInfo {
-                    cluster_id: obj.cluster_id,
-                    kind: obj.kind,
-                    hue: obj.visual_hue,
-                });
-                self.tracks.sort_by_key(|t| kind_group(t.kind));
-            }
-
-            // Mark any previous alive note for this cluster as finished.
-            // Do NOT update end_secs — it already stopped at the energy-threshold cutoff.
-            for prev in &mut self.notes {
-                if prev.alive && prev.cluster_id == obj.cluster_id {
-                    prev.alive = false;
-                }
-            }
-
-            self.notes.push_back(NoteEvent {
-                cluster_id: obj.cluster_id,
-                spawn_id: obj.spawn_id,
-                kind: obj.kind,
-                hue: obj.visual_hue,
-                start_secs: now,
-                end_secs: now,
-                alive: true,
-            });
+            notes.push(note.as_draw_note());
         }
 
-        // Deaths
-        for note in &mut self.notes {
-            if note.alive && !current_ids.contains(&note.spawn_id) {
-                note.alive = false;
+        for note in self.active_notes.values() {
+            if note.end_secs < cutoff {
+                continue;
             }
+            notes.push(note.as_draw_note());
         }
 
-        // Extend alive notes only while energy is above the kind-specific threshold.
-        // Percussive threshold is high so tick width is proportional to hit strength.
-        // Harmonic threshold is low so sustained notes extend for their full duration.
-        for note in &mut self.notes {
-            if note.alive {
-                let e = energies.get(&note.spawn_id).copied().unwrap_or(0.0);
-                let threshold = if note.kind == SoundKind::Percussive {
-                    PERC_NOTE_THRESHOLD
-                } else {
-                    HARM_NOTE_THRESHOLD
-                };
-                if e > threshold {
-                    note.end_secs = now;
-                }
-            }
-        }
-
-        // Prune notes that have scrolled fully off the left edge
-        let cutoff = now - history;
-        while self.notes.front().map_or(false, |n| n.end_secs < cutoff) {
-            self.notes.pop_front();
-        }
-
-        self.live_spawn_ids = current_ids;
+        notes.sort_by(|a, b| {
+            a.start_secs
+                .partial_cmp(&b.start_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        notes
     }
 
-    pub fn visible_notes(&self) -> impl Iterator<Item = DrawNote> + '_ {
-        let cutoff = self.elapsed_secs - self.history_secs();
-        self.notes.iter().filter_map(move |n| {
-            if n.end_secs < cutoff { return None; }
-            let track_idx = self.tracks.iter().position(|t| t.cluster_id == n.cluster_id)?;
-            Some(DrawNote {
-                track_idx,
-                hue: n.hue,
-                kind: n.kind,
-                start_secs: n.start_secs,
-                end_secs: n.end_secs,
-                alive: n.alive,
-            })
-        })
+    fn prune_history(&mut self) {
+        let cutoff = self.elapsed_secs - self.history_secs;
+        while self
+            .finished_notes
+            .front()
+            .is_some_and(|note| note.end_secs < cutoff)
+        {
+            self.finished_notes.pop_front();
+        }
+        self.active_notes
+            .retain(|_, note| note.end_secs >= cutoff || note.alive);
+    }
+}
+
+impl NoteEvent {
+    fn from_completed(note: &CompletedTranscribedNote) -> Self {
+        Self {
+            id: note.id,
+            stream_id: note.note.stream_id,
+            midi_note: note.note.midi_note,
+            start_secs: note.note.start_secs,
+            end_secs: note.note.end_secs,
+            confidence: note.note.confidence,
+            alive: false,
+        }
     }
 
-    pub fn num_tracks(&self) -> usize {
-        self.tracks.len()
+    fn from_active(note: &ActiveTranscribedNote) -> Self {
+        Self {
+            id: note.id,
+            stream_id: note.stream_id,
+            midi_note: note.midi_note,
+            start_secs: note.start_secs,
+            end_secs: note.end_secs,
+            confidence: note.confidence,
+            alive: true,
+        }
     }
+
+    fn as_draw_note(&self) -> DrawNote {
+        DrawNote {
+            id: self.id,
+            midi_note: self.midi_note,
+            hue: stream_hue(self.stream_id),
+            start_secs: self.start_secs,
+            end_secs: self.end_secs,
+            confidence: self.confidence.clamp(0.0, 1.0),
+            alive: self.alive,
+        }
+    }
+}
+
+fn stream_hue(stream_id: usize) -> f32 {
+    ((stream_id as f32 * 0.173_205_08) + 0.08).fract()
 }

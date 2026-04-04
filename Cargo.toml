@@ -13,3 +13,5 @@ spectrum-analyzer = "1"
 fundsp = "0.19"
 dasp = { version = "0.11", features = ["ring_buffer", "signal"] }
 ringbuf = "0.2"
+hound = "3.5"
+midly = "0.5"

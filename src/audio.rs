@@ -49,7 +49,9 @@ fn preferred_input_device(host: &cpal::Host) -> Option<cpal::Device> {
         }
     } else {
         println!("No virtual/loopback device found — falling back to default input (mic).");
-        println!("Install BlackHole for system audio: https://github.com/ExistentialAudio/BlackHole");
+        println!(
+            "Install BlackHole for system audio: https://github.com/ExistentialAudio/BlackHole"
+        );
     }
 
     loopback.or_else(|| host.default_input_device())
@@ -58,8 +60,7 @@ fn preferred_input_device(host: &cpal::Host) -> Option<cpal::Device> {
 impl AudioCapture {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
-        let device = preferred_input_device(&host)
-            .ok_or("no input device found")?;
+        let device = preferred_input_device(&host).ok_or("no input device found")?;
 
         let config = device.default_input_config()?;
         let sample_rate = config.sample_rate();

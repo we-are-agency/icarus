@@ -6,15 +6,16 @@ mod analysis;
 mod audio;
 mod midi_layer;
 mod objects;
-use analysis::{Analyser, CQT_BINS, CQT_HISTORY, FFT_DISPLAY_BINS, FFT_HISTORY};
+mod transcription;
+use analysis::{CQT_BINS, CQT_HISTORY, FFT_DISPLAY_BINS, FFT_HISTORY};
 use audio::{AudioCapture, FFT_SIZE};
 use midi_layer::MidiLayer;
-use objects::SoundObjectDetector;
+use transcription::{StreamingTranscriber, TRANSCRIPTION_HOP_SIZE};
 
 struct Model {
     audio: AudioCapture,
-    analyser: Analyser,
-    window: VecDeque<f32>,
+    transcriber: StreamingTranscriber,
+    pending_audio: VecDeque<f32>,
     /// Raw RGBA pixel buffer updated every frame (CQT_HISTORY × CQT_BINS × 4)
     spectrogram_pixels: Vec<u8>,
     /// Persistent GPU texture — updated via write_texture each frame
@@ -27,7 +28,6 @@ struct Model {
     kick_flash: f32,
     snare_flash: f32,
     hihat_flash: f32,
-    objects: SoundObjectDetector,
     midi: MidiLayer,
 }
 
@@ -44,27 +44,33 @@ fn model(app: &App) -> Model {
         .unwrap();
 
     let audio = AudioCapture::new().expect("failed to start audio capture");
-    let analyser = Analyser::new(audio.sample_rate);
+    let sample_rate = audio.sample_rate;
     let pixels = vec![0u8; CQT_HISTORY * CQT_BINS * 4];
     let blank = DynamicImage::ImageRgba8(
         ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
-            CQT_HISTORY as u32, CQT_BINS as u32, pixels.clone(),
-        ).unwrap(),
+            CQT_HISTORY as u32,
+            CQT_BINS as u32,
+            pixels.clone(),
+        )
+        .unwrap(),
     );
     let spectrogram_texture = wgpu::Texture::from_image(app, &blank);
 
     let fft_pixels = vec![0u8; FFT_HISTORY * FFT_DISPLAY_BINS * 4];
     let fft_blank = DynamicImage::ImageRgba8(
         ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
-            FFT_HISTORY as u32, FFT_DISPLAY_BINS as u32, fft_pixels.clone(),
-        ).unwrap(),
+            FFT_HISTORY as u32,
+            FFT_DISPLAY_BINS as u32,
+            fft_pixels.clone(),
+        )
+        .unwrap(),
     );
     let fft_spectrogram_texture = wgpu::Texture::from_image(app, &fft_blank);
 
     Model {
+        transcriber: StreamingTranscriber::new(sample_rate, 8),
         audio,
-        analyser,
-        window: VecDeque::from(vec![0.0f32; FFT_SIZE]),
+        pending_audio: VecDeque::with_capacity(FFT_SIZE * 4),
         spectrogram_pixels: pixels,
         spectrogram_texture,
         fft_spectrogram_pixels: fft_pixels,
@@ -72,42 +78,56 @@ fn model(app: &App) -> Model {
         kick_flash: 0.0,
         snare_flash: 0.0,
         hihat_flash: 0.0,
-        objects: SoundObjectDetector::new(),
-        midi: MidiLayer::new(),
+        midi: MidiLayer::new(sample_rate),
     }
 }
 
-fn update(_app: &App, model: &mut Model, update: Update) {
+fn update(_app: &App, model: &mut Model, _update: Update) {
     while let Some(s) = model.audio.consumer.pop() {
-        model.window.pop_front();
-        model.window.push_back(s);
+        model.pending_audio.push_back(s);
     }
-    model.analyser.process(&model.window);
-    let dt = update.since_last.as_secs_f32();
-    model.objects.process(&model.analyser.features, dt);
-    if model.objects.just_cleared {
-        model.midi.clear_all();
+
+    while model.pending_audio.len() >= TRANSCRIPTION_HOP_SIZE {
+        let block: Vec<f32> = model
+            .pending_audio
+            .drain(..TRANSCRIPTION_HOP_SIZE)
+            .collect();
+        model.transcriber.process_block(&block);
     }
-    model.midi.update(&model.objects.live_objects, dt);
+
+    let finished_notes = model.transcriber.drain_finished_notes();
+    let active_notes = model.transcriber.active_notes();
+    model.midi.update(
+        &finished_notes,
+        &active_notes,
+        model.transcriber.elapsed_secs(),
+    );
 
     // Beat flash decay
-    model.kick_flash  *= 0.82;
+    model.kick_flash *= 0.82;
     model.snare_flash *= 0.75;
     model.hihat_flash *= 0.70;
-    let f = &model.analyser.features;
-    if f.kick  { model.kick_flash  = (1.0f32).max(model.kick_flash); }
-    if f.snare { model.snare_flash = (1.0f32).max(model.snare_flash); }
-    if f.hihat { model.hihat_flash = (1.0f32).max(model.hihat_flash); }
+    let f = model.transcriber.features();
+    if f.kick {
+        model.kick_flash = (1.0f32).max(model.kick_flash);
+    }
+    if f.snare {
+        model.snare_flash = (1.0f32).max(model.snare_flash);
+    }
+    if f.hihat {
+        model.hihat_flash = (1.0f32).max(model.hihat_flash);
+    }
 
     // Rebuild CQT spectrogram pixel buffer
     let pixels = &mut model.spectrogram_pixels;
-    for (t, frame) in model.analyser.cqt_history.iter().enumerate() {
+    pixels.fill(0);
+    for (t, frame) in model.transcriber.cqt_history().iter().enumerate() {
         for (b, &mag) in frame.iter().enumerate() {
             // Flip Y: bin 0 = low freq = bottom of image = high pixel row
             let y = CQT_BINS - 1 - b;
             let idx = (y * CQT_HISTORY + t) * 4;
             let [r, g, bl, a] = spectrogram_rgba(mag);
-            pixels[idx]     = r;
+            pixels[idx] = r;
             pixels[idx + 1] = g;
             pixels[idx + 2] = bl;
             pixels[idx + 3] = a;
@@ -116,13 +136,14 @@ fn update(_app: &App, model: &mut Model, update: Update) {
 
     // Rebuild STFT spectrogram pixel buffer
     let fft_pixels = &mut model.fft_spectrogram_pixels;
-    for (t, frame) in model.analyser.fft_history.iter().enumerate() {
+    fft_pixels.fill(0);
+    for (t, frame) in model.transcriber.fft_history().iter().enumerate() {
         for (b, &mag) in frame.iter().enumerate() {
             // Flip Y: bin 0 = low freq = bottom = high pixel row
             let y = FFT_DISPLAY_BINS - 1 - b;
             let idx = (y * FFT_HISTORY + t) * 4;
             let [r, g, bl, a] = spectrogram_rgba(mag);
-            fft_pixels[idx]     = r;
+            fft_pixels[idx] = r;
             fft_pixels[idx + 1] = g;
             fft_pixels[idx + 2] = bl;
             fft_pixels[idx + 3] = a;
@@ -161,12 +182,12 @@ fn view(app: &App, model: &Model, frame: Frame) {
     draw.background().color(BLACK);
 
     let win = app.window_rect();
-    let f = &model.analyser.features;
+    let f = model.transcriber.features();
 
     let spec_h = win.h() * 0.78;
     let spec_bottom = win.bottom() + win.h() * 0.18;
 
-    // ── CQT spectrogram texture (hidden, kept for reference) ─────────────
+    // ── CQT spectrogram texture (pitch-aligned with the piano roll) ──────
     frame.device_queue_pair().queue().write_texture(
         wgpu::ImageCopyTexture {
             texture: model.spectrogram_texture.inner(),
@@ -186,9 +207,11 @@ fn view(app: &App, model: &Model, frame: Frame) {
             depth_or_array_layers: 1,
         },
     );
-    // draw.texture(&model.spectrogram_texture) — hidden
+    draw.texture(&model.spectrogram_texture)
+        .x_y(0.0, spec_bottom + spec_h * 0.5)
+        .w_h(win.w(), spec_h);
 
-    // ── STFT spectrogram texture (deepest layer) ──────────────────────────
+    // ── STFT spectrogram texture (maintained for optional alternate views) ──
     frame.device_queue_pair().queue().write_texture(
         wgpu::ImageCopyTexture {
             texture: model.fft_spectrogram_texture.inner(),
@@ -209,98 +232,101 @@ fn view(app: &App, model: &Model, frame: Frame) {
         },
     );
 
-    draw.texture(&model.fft_spectrogram_texture)
-        .x_y(0.0, spec_bottom + spec_h * 0.5)
-        .w_h(win.w(), spec_h);
-
-
-    // ── MIDI track layer ─────────────────────────────────────────────────
+    // ── Realtime transcription piano roll ────────────────────────────────
     {
         let midi = &model.midi;
-        let n_tracks = midi.num_tracks().max(1);
-        let history = midi.history_secs();
-        let now = midi.elapsed_secs;
+        let history = midi.history_secs().max(1e-3);
+        let now = midi.elapsed_secs();
         let t_offset = now - history;
 
         let panel_w = win.w();
         let panel_x0 = win.left();
-
-        let label_w = 40.0_f32;
+        let panel_y0 = spec_bottom;
+        let panel_y1 = spec_bottom + spec_h;
+        let label_w = 48.0_f32;
         let note_x0 = panel_x0 + label_w;
-        let note_w  = panel_w - label_w;
+        let note_w = panel_w - label_w;
+        let note_min = midi.note_min();
+        let note_max = midi.note_max();
+        let note_span = (note_max - note_min + 1) as f32;
+        let lane_h = (spec_h / note_span).max(2.0);
 
-        let track_h = spec_h / n_tracks as f32;
-
-        // Thin horizontal separator between every lane
-        for ti in 1..n_tracks {
-            let ly = spec_bottom + (n_tracks - ti) as f32 * track_h;
-            draw.line()
-                .start(pt2(panel_x0, ly))
-                .end(pt2(panel_x0 + panel_w, ly))
-                .color(rgba(1.0_f32, 1.0, 1.0, 0.06))
-                .weight(1.0);
-        }
-
-        // Group separator: thicker line + label between kind groups
-        let mut prev_group: Option<u8> = None;
-        const KIND_LABELS: [&str; 3] = ["PERC", "PH", "HARM"];
-        for (ti, track) in midi.tracks.iter().enumerate() {
-            let g = match track.kind {
-                objects::SoundKind::Percussive         => 0u8,
-                objects::SoundKind::PercussiveHarmonic => 1,
-                objects::SoundKind::Harmonic           => 2,
-            };
-            if Some(g) != prev_group {
-                let ly = spec_bottom + (n_tracks - ti) as f32 * track_h;
-                draw.line()
-                    .start(pt2(panel_x0, ly))
-                    .end(pt2(panel_x0 + panel_w, ly))
-                    .color(rgba(1.0_f32, 1.0, 1.0, 0.28))
-                    .weight(1.5);
-                draw.text(KIND_LABELS[g as usize])
-                    .x_y(panel_x0 + label_w + 6.0, ly + 5.0)
-                    .font_size(7)
-                    .color(rgba(1.0_f32, 1.0, 1.0, 0.35));
-                prev_group = Some(g);
-            }
-        }
-
-        // Notes — all rendered as rectangles proportional to actual duration
-        for dn in midi.visible_notes() {
-            let ti = dn.track_idx;
-            if ti >= n_tracks { continue; }
-            let lane_cy = spec_bottom + (n_tracks - 1 - ti) as f32 * track_h + track_h * 0.5;
-            let note_bar_h = (track_h * 0.65).max(3.0);
-            let x_start = (note_x0 + (dn.start_secs - t_offset) / history * note_w).clamp(note_x0, note_x0 + note_w);
-            let x_end   = (note_x0 + (dn.end_secs   - t_offset) / history * note_w).clamp(note_x0, note_x0 + note_w);
-            let block_w = (x_end - x_start).max(1.0);
-            let lit   = if dn.kind == objects::SoundKind::Percussive { 0.72 } else { 0.58 };
-            let alpha = 0.88_f32;
-            draw.rect()
-                .x_y(x_start + block_w * 0.5, lane_cy)
-                .w_h(block_w, note_bar_h)
-                .color(hsla(dn.hue, 1.0, lit, alpha));
-            if dn.alive {
+        for midi_note in note_min..=note_max {
+            let y = midi_pitch_y(midi_note, note_min, note_max, panel_y0, panel_y1);
+            let pitch_class = midi_note % 12;
+            let is_black_key = matches!(pitch_class, 1 | 3 | 6 | 8 | 10);
+            if is_black_key {
                 draw.rect()
-                    .x_y(x_end - 1.0, lane_cy)
-                    .w_h(2.0, note_bar_h)
-                    .color(rgba(1.0_f32, 1.0, 1.0, 0.75));
+                    .x_y(note_x0 + note_w * 0.5, y)
+                    .w_h(note_w, lane_h)
+                    .color(rgba(0.02, 0.03, 0.04, 0.22));
+            }
+
+            let line_alpha = if pitch_class == 0 { 0.20 } else { 0.06 };
+            draw.line()
+                .start(pt2(note_x0, y))
+                .end(pt2(note_x0 + note_w, y))
+                .color(rgba(1.0, 1.0, 1.0, line_alpha))
+                .weight(if pitch_class == 0 { 1.25 } else { 1.0 });
+
+            if pitch_class == 0 {
+                draw.text(&midi_pitch_label(midi_note))
+                    .x_y(panel_x0 + label_w * 0.45, y + 4.0)
+                    .font_size(9)
+                    .color(rgba(1.0, 1.0, 1.0, 0.45));
             }
         }
 
-        // Track labels: color dot + cluster index
-        for (ti, track) in midi.tracks.iter().enumerate() {
-            let lane_cy = spec_bottom + (n_tracks - 1 - ti) as f32 * track_h + track_h * 0.5;
-            draw.ellipse()
-                .x_y(panel_x0 + 8.0, lane_cy)
-                .w_h(7.0, 7.0)
-                .color(hsl(track.hue, 1.0, 0.60));
-            let id_str = format!("{}", track.cluster_id);
-            draw.text(&id_str)
-                .x_y(panel_x0 + 26.0, lane_cy)
-                .font_size(8)
-                .color(rgba(1.0_f32, 1.0, 1.0, 0.60));
+        let mut grid_secs = (history / 6.0).max(0.25);
+        grid_secs = (grid_secs * 4.0).round() / 4.0;
+        if grid_secs <= 0.0 {
+            grid_secs = 0.25;
         }
+        let first_grid = (t_offset / grid_secs).floor() * grid_secs;
+        let mut grid_t = first_grid;
+        while grid_t <= now {
+            let x = note_x0 + (grid_t - t_offset) / history * note_w;
+            draw.line()
+                .start(pt2(x, panel_y0))
+                .end(pt2(x, panel_y1))
+                .color(rgba(1.0, 1.0, 1.0, 0.06))
+                .weight(1.0);
+            grid_t += grid_secs;
+        }
+
+        for note in midi.visible_notes() {
+            let y = midi_pitch_y(note.midi_note, note_min, note_max, panel_y0, panel_y1);
+            let x_start = (note_x0 + (note.start_secs - t_offset) / history * note_w)
+                .clamp(note_x0, note_x0 + note_w);
+            let x_end = (note_x0 + (note.end_secs - t_offset) / history * note_w)
+                .clamp(note_x0, note_x0 + note_w);
+            let block_w = (x_end - x_start).max(2.0);
+            let alpha = 0.28 + 0.60 * note.confidence;
+            let lit = if note.alive { 0.64 } else { 0.54 };
+
+            draw.rect()
+                .x_y(x_start + block_w * 0.5, y)
+                .w_h(block_w, lane_h * 0.82)
+                .color(hsla(note.hue, 0.88, lit, alpha));
+
+            if note.alive {
+                draw.rect()
+                    .x_y(x_end - 1.0, y)
+                    .w_h(2.0, lane_h.max(4.0))
+                    .color(rgba(1.0, 1.0, 1.0, 0.78));
+            }
+        }
+
+        draw.line()
+            .start(pt2(note_x0 + note_w, panel_y0))
+            .end(pt2(note_x0 + note_w, panel_y1))
+            .color(rgba(1.0, 1.0, 1.0, 0.35))
+            .weight(1.5);
+
+        draw.text("MIDI")
+            .x_y(panel_x0 + label_w * 0.45, panel_y1 - 10.0)
+            .font_size(11)
+            .color(rgba(1.0, 1.0, 1.0, 0.60));
     }
 
     // ── 6 band energy bars ────────────────────────────────────────────────
@@ -348,16 +374,16 @@ fn view(app: &App, model: &Model, frame: Frame) {
     }
 
     // ── Kick / Snare / Hi-hat composite indicators (top right) ───────────
-    let ind_labels: [(&str, bool, f32, f32); 3] = [
-        ("KICK",  f.kick,  f.kick_strength,  0.07),
-        ("SNARE", f.snare, f.snare_strength, 0.0),
-        ("HIHAT", f.hihat, f.hihat_strength, 0.60),
+    let ind_labels: [(&str, bool, f32, f32, f32); 3] = [
+        ("KICK", f.kick, f.kick_strength, 0.07, model.kick_flash),
+        ("SNARE", f.snare, f.snare_strength, 0.0, model.snare_flash),
+        ("HIHAT", f.hihat, f.hihat_strength, 0.60, model.hihat_flash),
     ];
     let ind_x0 = win.right() - 90.0;
-    let ind_y0 = win.top()   - 28.0;
-    for (j, &(label, beat, strength, hue)) in ind_labels.iter().enumerate() {
+    let ind_y0 = win.top() - 28.0;
+    for (j, &(label, beat, strength, hue, flash)) in ind_labels.iter().enumerate() {
         let iy = ind_y0 - j as f32 * 26.0;
-        let lit = if beat { 0.75 } else { 0.20 };
+        let lit = 0.18 + 0.57 * flash.max(if beat { 1.0 } else { 0.0 });
         draw.ellipse()
             .x_y(ind_x0, iy)
             .w_h(14.0, 14.0)
@@ -379,13 +405,13 @@ fn view(app: &App, model: &Model, frame: Frame) {
     let strip_y = win.bottom() + strip_h * 0.5;
 
     let labels: &[(&str, f32, f32, &str, &str)] = &[
-        ("BRIGHT",  f.brightness,                      0.15, "dark",       "bright"),
-        ("ROUGH",   f.roughness,                        0.05, "smooth",     "rough"),
-        ("SUSTAIN", f.sustain,                          0.55, "percussive", "sustained"),
-        ("WIDTH",   f.width,                            0.60, "narrow",     "wide"),
-        ("H/P",     f.harmonic_ratio,                   0.35, "percussive", "harmonic"),
-        ("ONSET",   f.onset_strength.clamp(0.0, 1.0),  0.0,  "",           ""),
-        ("RMS",     f.rms,                              0.45, "",           ""),
+        ("BRIGHT", f.brightness, 0.15, "dark", "bright"),
+        ("ROUGH", f.roughness, 0.05, "smooth", "rough"),
+        ("SUSTAIN", f.sustain, 0.55, "percussive", "sustained"),
+        ("WIDTH", f.width, 0.60, "narrow", "wide"),
+        ("H/P", f.harmonic_ratio, 0.35, "percussive", "harmonic"),
+        ("ONSET", f.onset_strength.clamp(0.0, 1.0), 0.0, "", ""),
+        ("RMS", f.rms, 0.45, "", ""),
     ];
 
     let col_w = win.w() / labels.len() as f32;
@@ -429,4 +455,15 @@ fn view(app: &App, model: &Model, frame: Frame) {
     }
 
     draw.to_frame(app, &frame).unwrap();
+}
+
+fn midi_pitch_y(midi_note: u8, note_min: u8, note_max: u8, panel_y0: f32, panel_y1: f32) -> f32 {
+    let note_span = (note_max - note_min + 1) as f32;
+    let normalized = (midi_note.saturating_sub(note_min) as f32 + 0.5) / note_span.max(1.0);
+    panel_y0 + normalized * (panel_y1 - panel_y0)
+}
+
+fn midi_pitch_label(midi_note: u8) -> String {
+    let octave = midi_note as i32 / 12 - 1;
+    format!("C{octave}")
 }
