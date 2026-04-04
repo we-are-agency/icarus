@@ -20,7 +20,6 @@ struct LayerMenuItem {
     layers: Vec<LayerKind>,
     label: &'static str,
     active: bool,
-    hue: f32,
 }
 
 struct Model {
@@ -98,19 +97,16 @@ fn model(app: &App) -> Model {
                 layers: vec![LayerKind::Analysis],
                 label: "Analysis",
                 active: true,
-                hue: 0.15,
             },
             LayerMenuItem {
                 layers: vec![LayerKind::Harmonics],
                 label: "Harmonics",
                 active: true,
-                hue: 0.34,
             },
             LayerMenuItem {
                 layers: vec![LayerKind::Percussion],
                 label: "Percussion",
                 active: true,
-                hue: 0.60,
             },
         ],
         selected_group: 0,
@@ -290,7 +286,7 @@ fn draw_menu_layer(draw: &Draw, win: Rect, model: &Model) {
             draw.rect()
                 .x_y(item_x, indicator_y)
                 .w_h(estimated_w, indicator_h)
-                .color(hsla(item.hue, 0.78, 0.54, 0.82));
+                .color(rgba(0.18, 0.19, 0.21, 0.90));
 
             if is_selected {
                 draw.line()

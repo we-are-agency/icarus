@@ -120,6 +120,34 @@ pub struct LoadedPair {
     pub max_polyphony: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentSelection {
+    Percussive,
+    Harmonic,
+    PercussiveHarmonic,
+}
+
+impl InstrumentSelection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Percussive => "Percussive",
+            Self::Harmonic => "Harmonic",
+            Self::PercussiveHarmonic => "PercussiveHarmonic",
+        }
+    }
+}
+
+impl From<SoundKind> for InstrumentSelection {
+    fn from(value: SoundKind) -> Self {
+        match value {
+            SoundKind::Percussive => Self::Percussive,
+            SoundKind::Harmonic => Self::Harmonic,
+            SoundKind::PercussiveHarmonic => Self::PercussiveHarmonic,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscribedNote {
     pub stream_id: usize,
@@ -127,6 +155,7 @@ pub struct TranscribedNote {
     pub start_secs: f32,
     pub end_secs: f32,
     pub confidence: f32,
+    pub instrument_selection: InstrumentSelection,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +172,7 @@ pub struct ActiveTranscribedNote {
     pub start_secs: f32,
     pub end_secs: f32,
     pub confidence: f32,
+    pub instrument_selection: InstrumentSelection,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -421,6 +451,7 @@ struct ActiveNote {
     last_seen_secs: f32,
     confidence: f32,
     brightness: f32,
+    instrument_selection: InstrumentSelection,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +509,15 @@ enum BirthDecision {
 enum ActiveKind {
     Harmonic,
     Percussive,
+}
+
+impl ActiveKind {
+    fn instrument_selection(self) -> InstrumentSelection {
+        match self {
+            Self::Harmonic => InstrumentSelection::Harmonic,
+            Self::Percussive => InstrumentSelection::Percussive,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -574,6 +614,7 @@ impl OnlineNoteTranscriber {
                 start_secs: active.start_secs,
                 end_secs,
                 confidence: active.confidence,
+                instrument_selection: active.instrument_selection,
             });
         }
         self.finished_notes.sort_by(|a, b| {
@@ -791,6 +832,7 @@ impl OnlineNoteTranscriber {
             last_seen_secs: start_secs,
             confidence: candidate.confidence,
             brightness: object.acoustic_x,
+            instrument_selection: object.kind.into(),
         });
     }
 
@@ -803,6 +845,7 @@ impl OnlineNoteTranscriber {
             start_secs: active.start_secs,
             end_secs,
             confidence: active.confidence,
+            instrument_selection: active.instrument_selection,
         });
     }
 
@@ -902,6 +945,7 @@ impl RealtimeTranscriber {
                 note.start_secs,
                 end_secs.max(note.start_secs + 1e-3),
                 note.confidence,
+                note.kind.instrument_selection(),
             );
         }
         self.finished_notes
@@ -917,6 +961,7 @@ impl RealtimeTranscriber {
         start_secs: f32,
         end_secs: f32,
         confidence: f32,
+        instrument_selection: InstrumentSelection,
     ) {
         self.finished_notes.push(CompletedTranscribedNote {
             id,
@@ -926,6 +971,7 @@ impl RealtimeTranscriber {
                 start_secs,
                 end_secs,
                 confidence,
+                instrument_selection,
             },
         });
     }
@@ -1407,6 +1453,7 @@ impl RealtimeTranscriber {
             start_secs,
             start_secs + DRUM_NOTE_LENGTH_SECS,
             self.analyser.features.percussive_confidence.max(0.3),
+            InstrumentSelection::Percussive,
         );
         self.update_stream(stream_id, midi_note, brightness);
         self.drum_cooldowns[class_idx] = DRUM_COOLDOWN_SECS;
@@ -1437,6 +1484,7 @@ impl RealtimeTranscriber {
             note.start_secs,
             end_secs.max(note.start_secs + HARMONIC_MIN_NOTE_SECS),
             note.confidence,
+            note.kind.instrument_selection(),
         );
     }
 
@@ -1543,6 +1591,7 @@ impl StreamingTranscriber {
                 start_secs: note.start_secs,
                 end_secs: self.inner.elapsed_secs.max(note.start_secs + 1e-3),
                 confidence: note.confidence,
+                instrument_selection: note.kind.instrument_selection(),
             })
             .collect()
     }
@@ -3190,6 +3239,7 @@ mod tests {
             start_secs: 1.0,
             end_secs: 1.5,
             confidence: 1.0,
+            instrument_selection: InstrumentSelection::Harmonic,
         }];
         let reference = vec![GroundTruthNote {
             source_id: 0,
@@ -3212,6 +3262,7 @@ mod tests {
             start_secs: 1.04,
             end_secs: 1.58,
             confidence: 1.0,
+            instrument_selection: InstrumentSelection::Harmonic,
         }];
         let reference = vec![GroundTruthNote {
             source_id: 0,
@@ -3250,6 +3301,7 @@ mod tests {
                 start_secs: 0.0,
                 end_secs: 0.5,
                 confidence: 1.0,
+                instrument_selection: InstrumentSelection::Harmonic,
             },
             TranscribedNote {
                 stream_id: 0,
@@ -3257,6 +3309,7 @@ mod tests {
                 start_secs: 1.02,
                 end_secs: 1.10,
                 confidence: 0.8,
+                instrument_selection: InstrumentSelection::Harmonic,
             },
             TranscribedNote {
                 stream_id: 0,
@@ -3264,6 +3317,7 @@ mod tests {
                 start_secs: 2.0,
                 end_secs: 2.2,
                 confidence: 0.6,
+                instrument_selection: InstrumentSelection::Harmonic,
             },
         ];
 

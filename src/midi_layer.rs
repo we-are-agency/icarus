@@ -1,6 +1,6 @@
 use crate::analysis::CQT_HISTORY;
 use crate::transcription::{
-    ActiveTranscribedNote, CompletedTranscribedNote, TRANSCRIPTION_HOP_SIZE,
+    ActiveTranscribedNote, CompletedTranscribedNote, InstrumentSelection, TRANSCRIPTION_HOP_SIZE,
     TRANSCRIPTION_MIDI_HIGH, TRANSCRIPTION_MIDI_LOW,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -14,6 +14,7 @@ struct NoteEvent {
     end_secs: f32,
     confidence: f32,
     alive: bool,
+    instrument_selection: InstrumentSelection,
 }
 
 pub struct DrawNote {
@@ -24,6 +25,7 @@ pub struct DrawNote {
     pub end_secs: f32,
     pub confidence: f32,
     pub alive: bool,
+    pub instrument_selection: InstrumentSelection,
 }
 
 pub struct MidiLayer {
@@ -86,19 +88,30 @@ impl MidiLayer {
     }
 
     pub fn visible_notes(&self) -> Vec<DrawNote> {
+        self.visible_notes_for_selection(None)
+    }
+
+    pub fn visible_notes_for_selection(
+        &self,
+        selection: Option<InstrumentSelection>,
+    ) -> Vec<DrawNote> {
         let cutoff = self.elapsed_secs - self.history_secs;
         let mut notes =
             Vec::with_capacity(self.finished_notes.len().saturating_add(self.active_notes.len()));
 
         for note in &self.finished_notes {
-            if note.end_secs < cutoff {
+            if note.end_secs < cutoff
+                || selection.is_some_and(|instrument| note.instrument_selection != instrument)
+            {
                 continue;
             }
             notes.push(note.as_draw_note());
         }
 
         for note in self.active_notes.values() {
-            if note.end_secs < cutoff {
+            if note.end_secs < cutoff
+                || selection.is_some_and(|instrument| note.instrument_selection != instrument)
+            {
                 continue;
             }
             notes.push(note.as_draw_note());
@@ -111,6 +124,37 @@ impl MidiLayer {
                 .then_with(|| a.id.cmp(&b.id))
         });
         notes
+    }
+
+    pub fn group_rms(&self, selection: InstrumentSelection) -> f32 {
+        let mut sum_squares = 0.0f32;
+        let mut count = 0usize;
+
+        for note in &self.finished_notes {
+            if note.instrument_selection == selection
+                && note.start_secs <= self.elapsed_secs
+                && note.end_secs >= self.elapsed_secs
+            {
+                sum_squares += note.confidence * note.confidence;
+                count += 1;
+            }
+        }
+
+        for note in self.active_notes.values() {
+            if note.instrument_selection == selection
+                && note.start_secs <= self.elapsed_secs
+                && note.end_secs >= self.elapsed_secs
+            {
+                sum_squares += note.confidence * note.confidence;
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            0.0
+        } else {
+            (sum_squares / count as f32).sqrt().clamp(0.0, 1.0)
+        }
     }
 
     fn prune_history(&mut self) {
@@ -137,6 +181,7 @@ impl NoteEvent {
             end_secs: note.note.end_secs,
             confidence: note.note.confidence,
             alive: false,
+            instrument_selection: note.note.instrument_selection,
         }
     }
 
@@ -149,6 +194,7 @@ impl NoteEvent {
             end_secs: note.end_secs,
             confidence: note.confidence,
             alive: true,
+            instrument_selection: note.instrument_selection,
         }
     }
 
@@ -161,6 +207,7 @@ impl NoteEvent {
             end_secs: self.end_secs,
             confidence: self.confidence.clamp(0.0, 1.0),
             alive: self.alive,
+            instrument_selection: self.instrument_selection,
         }
     }
 }
