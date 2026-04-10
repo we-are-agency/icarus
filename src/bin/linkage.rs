@@ -16,7 +16,6 @@ const PANE_LINE_H: f32 = 12.0;
 const SPEC_RATIO: f32 = 0.38;
 const GRID_STEP: f32 = 36.0;
 const RENDER_VIEW_Y_OFFSET: f32 = 10.0;
-const P1_START_ANGLE: f32 = 0.78;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
@@ -32,6 +31,9 @@ struct Model {
     capture_path: Option<PathBuf>,
     fixtures: Vec<FixturePresentation>,
     selected_fixture: usize,
+    playback_phase: f32,
+    playback_paused: bool,
+    active_artifact_turn: Option<u32>,
     headless_capture_state: Cell<HeadlessCaptureState>,
     headless_capture_result: Arc<AtomicU8>,
     headless_proxy: Option<nannou::app::Proxy>,
@@ -52,15 +54,58 @@ struct FixturePresentation {
 }
 
 enum FixtureStatus {
-    Solved(SolvedAssembly),
+    Solved(Arc<SweepArtifact>),
     ValidationError(String),
     SolverError(String),
+}
+
+struct SweepArtifact {
+    assembly: Arc<AssemblySpec>,
+    frames: Vec<SolvedFrame>,
+    telemetry: SweepTelemetry,
+    turn: u32,
+    reset_phase: bool,
+    cycle_seconds: f32,
+    playback: PlaybackTraversal,
+}
+
+struct SweepTelemetry {
+    point_paths: BTreeMap<String, Vec<Point2>>,
+}
+
+struct SolvedFrame {
+    u: f32,
+    joint_positions: BTreeMap<String, Point2>,
+    drive_values: BTreeMap<String, f32>,
+    poi_positions: BTreeMap<String, Point2>,
+}
+
+#[derive(Clone, Copy)]
+enum PlaybackTraversal {
+    Forward,
+    PingPong,
+}
+
+#[derive(Clone, Copy)]
+enum DriveParameter {
+    Angle,
+    SliderPosition,
+}
+
+struct DrivePlan {
+    drive_id: String,
+    parameter: DriveParameter,
+    start_value: f32,
+    end_value: f32,
+    cycle_seconds: f32,
+    playback: PlaybackTraversal,
 }
 
 struct SolvedAssembly {
     joints: BTreeMap<String, SolvedJoint>,
     links: Vec<SolvedLink>,
     slider: SolvedSlider,
+    pois: Vec<SolvedPoi>,
 }
 
 struct SolvedJoint {
@@ -79,7 +124,11 @@ struct SolvedSlider {
     joint: String,
 }
 
-#[derive(Serialize)]
+struct SolvedPoi {
+    position: Point2,
+}
+
+#[derive(Clone, Serialize)]
 struct AssemblySpec {
     joints: BTreeMap<String, JointSpec>,
     parts: BTreeMap<String, PartSpec>,
@@ -88,14 +137,14 @@ struct AssemblySpec {
     meta: AssemblyMeta,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "type")]
 enum JointSpec {
     Fixed { position: [f32; 2] },
     Free,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "type")]
 enum PartSpec {
     Link {
@@ -111,30 +160,37 @@ enum PartSpec {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct DriveSpec {
     kind: DriveKindSpec,
     sweep: SweepSpec,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "type")]
 enum DriveKindSpec {
     Angular {
         pivot_joint: String,
         tip_joint: String,
         link: String,
-        range: [f32; 2],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        range: Option<[f32; 2]>,
+    },
+    #[allow(dead_code)]
+    Linear {
+        slider: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        range: Option<[f32; 2]>,
     },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SweepSpec {
     samples: u32,
     direction: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct PointOfInterestSpec {
     id: String,
     host: String,
@@ -142,7 +198,7 @@ struct PointOfInterestSpec {
     perp: f32,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct AssemblyMeta {
     name: String,
     iteration: u32,
@@ -178,9 +234,10 @@ impl Config {
                     let Some(value) = args.next() else {
                         panic!("--fixture requires an index");
                     };
-                    fixture_index = value
+                    let parsed = value
                         .parse::<usize>()
-                        .expect("--fixture must be a zero-based integer");
+                        .expect("--fixture must be a one-based integer");
+                    fixture_index = parsed.saturating_sub(1);
                 }
                 other => panic!("unknown argument: {other}"),
             }
@@ -223,6 +280,9 @@ fn model(app: &App) -> Model {
         capture_path: config.capture_path,
         selected_fixture: config.fixture_index.min(fixtures.len().saturating_sub(1)),
         fixtures,
+        playback_phase: 0.0,
+        playback_paused: false,
+        active_artifact_turn: None,
         headless_capture_state: Cell::new(HeadlessCaptureState::Pending),
         headless_capture_result: Arc::new(AtomicU8::new(0)),
         headless_proxy: if config.headless {
@@ -234,7 +294,25 @@ fn model(app: &App) -> Model {
     }
 }
 
-fn update(app: &App, model: &mut Model, _update: Update) {
+fn update(app: &App, model: &mut Model, update: Update) {
+    if let Some((turn, reset_phase, cycle_seconds)) = current_artifact(model)
+        .map(|artifact| (artifact.turn, artifact.reset_phase, artifact.cycle_seconds))
+    {
+        if model.active_artifact_turn != Some(turn) {
+            if reset_phase {
+                model.playback_phase = 0.0;
+            }
+            model.active_artifact_turn = Some(turn);
+        }
+
+        if !model.playback_paused {
+            let delta = update.since_last.as_secs_f32() / cycle_seconds.max(0.001);
+            model.playback_phase = (model.playback_phase + delta).rem_euclid(1.0);
+        }
+    } else {
+        model.active_artifact_turn = None;
+    }
+
     if model.headless && model.headless_capture_state.get() == HeadlessCaptureState::Queued {
         match model.headless_capture_result.load(Ordering::SeqCst) {
             1 => {
@@ -258,6 +336,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 .unwrap_or_else(|| PathBuf::from("target/linkage-windowed-capture.png"));
             app.main_window().capture_frame(path);
         }
+        Key::Space => model.playback_paused = !model.playback_paused,
         Key::Key1 => select_fixture(model, 0),
         Key::Key2 => select_fixture(model, 1),
         Key::Key3 => select_fixture(model, 2),
@@ -343,6 +422,13 @@ fn current_fixture(model: &Model) -> &FixturePresentation {
     &model.fixtures[model.selected_fixture]
 }
 
+fn current_artifact(model: &Model) -> Option<&Arc<SweepArtifact>> {
+    match &current_fixture(model).status {
+        FixtureStatus::Solved(artifact) => Some(artifact),
+        FixtureStatus::ValidationError(_) | FixtureStatus::SolverError(_) => None,
+    }
+}
+
 fn build_fixture_presentations() -> Result<Vec<FixturePresentation>, String> {
     let fixtures = vec![
         ("1 VALID", slider_crank_fixture()),
@@ -363,8 +449,8 @@ fn build_fixture_presentation(
     let json = serde_json::to_string_pretty(&assembly)
         .map_err(|err| format!("failed to serialize fixture JSON: {err}"))?;
     let status = match validate_fixture(&assembly) {
-        Ok(()) => match solve_slider_crank_origin(&assembly) {
-            Ok(solved) => FixtureStatus::Solved(solved),
+        Ok(()) => match build_sweep_artifact(assembly.clone(), 1) {
+            Ok(artifact) => FixtureStatus::Solved(Arc::new(artifact)),
             Err(err) => FixtureStatus::SolverError(err),
         },
         Err(err) => FixtureStatus::ValidationError(err),
@@ -382,7 +468,7 @@ fn slider_crank_fixture() -> AssemblySpec {
     joints.insert(
         "j_pivot".to_string(),
         JointSpec::Fixed {
-            position: [0.0, 0.0],
+            position: [-80.0, 60.0],
         },
     );
     joints.insert("j_tip".to_string(), JointSpec::Free);
@@ -411,7 +497,7 @@ fn slider_crank_fixture() -> AssemblySpec {
             joint: "j_slide".to_string(),
             axis_origin: [0.0, 0.0],
             axis_dir: [1.0, 0.0],
-            range: [-80.0, 260.0],
+            range: [-20.0, 180.0],
         },
     );
 
@@ -423,11 +509,11 @@ fn slider_crank_fixture() -> AssemblySpec {
                 pivot_joint: "j_pivot".to_string(),
                 tip_joint: "j_tip".to_string(),
                 link: "l_crank".to_string(),
-                range: [P1_START_ANGLE, TAU],
+                range: None,
             },
             sweep: SweepSpec {
                 samples: 180,
-                direction: "Forward",
+                direction: "Clockwise",
             },
         },
     );
@@ -436,7 +522,12 @@ fn slider_crank_fixture() -> AssemblySpec {
         joints,
         parts,
         drives,
-        points_of_interest: Vec::new(),
+        points_of_interest: vec![PointOfInterestSpec {
+            id: "poi_coupler_mid".to_string(),
+            host: "l_coupler".to_string(),
+            t: 0.5,
+            perp: 0.0,
+        }],
         meta: AssemblyMeta {
             name: "p1-slider-crank".to_string(),
             iteration: 1,
@@ -457,11 +548,11 @@ fn invalid_reference_fixture() -> AssemblySpec {
 
 fn unsolved_slider_crank_fixture() -> AssemblySpec {
     let mut assembly = slider_crank_fixture();
-    if let Some(PartSpec::Link { length, .. }) = assembly.parts.get_mut("l_coupler") {
-        *length = 30.0;
+    if let Some(PartSpec::Slider { range, .. }) = assembly.parts.get_mut("s_track") {
+        *range = [500.0, 600.0];
     }
     assembly.meta.name = "p1-unsolved-slider-crank".to_string();
-    assembly.meta.notes = vec!["Intentional solver failure".to_string()];
+    assembly.meta.notes = vec!["Intentional solver range failure".to_string()];
     assembly
 }
 
@@ -509,6 +600,7 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
                 pivot_joint,
                 tip_joint,
                 link,
+                range,
                 ..
             } => {
                 if !assembly.joints.contains_key(pivot_joint) {
@@ -522,14 +614,60 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
                 if !assembly.parts.contains_key(link) {
                     return Err(format!("drive {drive_id}: missing link {link}"));
                 }
+                if let Some([start, end]) = range {
+                    if !start.is_finite() || !end.is_finite() || (*start - *end).abs() < 0.000_1 {
+                        return Err(format!("drive {drive_id}: invalid angular range"));
+                    }
+                }
+                if !matches!(
+                    drive.sweep.direction,
+                    "Clockwise" | "CW" | "Forward" | "CounterClockwise" | "CCW" | "Reverse"
+                ) {
+                    return Err(format!(
+                        "drive {drive_id}: unsupported angular direction {}",
+                        drive.sweep.direction
+                    ));
+                }
             }
+            DriveKindSpec::Linear { slider, range } => {
+                let Some(PartSpec::Slider {
+                    range: slider_range,
+                    ..
+                }) = assembly.parts.get(slider)
+                else {
+                    return Err(format!("drive {drive_id}: missing slider part {slider}"));
+                };
+                if let Some([start, end]) = range {
+                    if !start.is_finite() || !end.is_finite() || (*start - *end).abs() < 0.000_1 {
+                        return Err(format!("drive {drive_id}: invalid linear range"));
+                    }
+                    if *start < slider_range[0]
+                        || *start > slider_range[1]
+                        || *end < slider_range[0]
+                        || *end > slider_range[1]
+                    {
+                        return Err(format!(
+                            "drive {drive_id}: linear range lies outside slider track"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for poi in &assembly.points_of_interest {
+        let Some(host_part) = assembly.parts.get(&poi.host) else {
+            return Err(format!("poi {}: missing host part {}", poi.id, poi.host));
+        };
+        if !matches!(host_part, PartSpec::Link { .. }) {
+            return Err(format!("poi {}: host {} is not a link", poi.id, poi.host));
         }
     }
 
     Ok(())
 }
 
-fn solve_slider_crank_origin(assembly: &AssemblySpec) -> Result<SolvedAssembly, String> {
+fn solve_slider_crank_pose(assembly: &AssemblySpec, theta: f32) -> Result<SolvedAssembly, String> {
     let pivot = match assembly.joints.get("j_pivot") {
         Some(JointSpec::Fixed { position }) => pt2(position[0], position[1]),
         _ => return Err("fixture missing fixed pivot".to_string()),
@@ -556,13 +694,6 @@ fn solve_slider_crank_origin(assembly: &AssemblySpec) -> Result<SolvedAssembly, 
             (pt2(axis_origin[0], axis_origin[1]), (range[0], range[1]))
         }
         _ => return Err("fixture missing slider track".to_string()),
-    };
-    let theta = match assembly.drives.get("d_crank") {
-        Some(DriveSpec {
-            kind: DriveKindSpec::Angular { range, .. },
-            ..
-        }) => range[0],
-        _ => return Err("fixture missing crank drive".to_string()),
     };
 
     let tip = pt2(
@@ -603,6 +734,7 @@ fn solve_slider_crank_origin(assembly: &AssemblySpec) -> Result<SolvedAssembly, 
             fixed: false,
         },
     );
+    let poi_positions = solve_poi_positions(assembly, &joints)?;
 
     Ok(SolvedAssembly {
         joints,
@@ -621,7 +753,221 @@ fn solve_slider_crank_origin(assembly: &AssemblySpec) -> Result<SolvedAssembly, 
             end: pt2(slider_range.1, axis_origin.y),
             joint: "j_slide".to_string(),
         },
+        pois: poi_positions
+            .into_iter()
+            .map(|(_, position)| SolvedPoi { position })
+            .collect(),
     })
+}
+
+fn solve_slider_crank_from_slider(
+    assembly: &AssemblySpec,
+    slider_value: f32,
+) -> Result<SolvedAssembly, String> {
+    let pivot = match assembly.joints.get("j_pivot") {
+        Some(JointSpec::Fixed { position }) => pt2(position[0], position[1]),
+        _ => return Err("fixture missing fixed pivot".to_string()),
+    };
+    let crank_length = match assembly.parts.get("l_crank") {
+        Some(PartSpec::Link { length, .. }) => *length,
+        _ => return Err("fixture missing crank link".to_string()),
+    };
+    let coupler_length = match assembly.parts.get("l_coupler") {
+        Some(PartSpec::Link { length, .. }) => *length,
+        _ => return Err("fixture missing coupler link".to_string()),
+    };
+    let (axis_origin, axis_dir) = match assembly.parts.get("s_track") {
+        Some(PartSpec::Slider {
+            axis_origin,
+            axis_dir,
+            ..
+        }) => {
+            if axis_dir[0].abs() < 0.999 || axis_dir[1].abs() > 0.001 {
+                return Err("P2 slider solver assumes a horizontal slider axis".to_string());
+            }
+            (
+                pt2(axis_origin[0], axis_origin[1]),
+                vec2(axis_dir[0], axis_dir[1]),
+            )
+        }
+        _ => return Err("fixture missing slider track".to_string()),
+    };
+
+    let slide = pt2(
+        axis_origin.x + axis_dir.x * slider_value,
+        axis_origin.y + axis_dir.y * slider_value,
+    );
+    let delta = slide - pivot;
+    let distance = delta.length();
+    if distance > crank_length + coupler_length
+        || distance < (crank_length - coupler_length).abs()
+        || distance <= 0.000_1
+    {
+        return Err("slider position cannot be reached by the current link lengths".to_string());
+    }
+
+    let a = (crank_length * crank_length - coupler_length * coupler_length + distance * distance)
+        / (2.0 * distance);
+    let h_sq = crank_length * crank_length - a * a;
+    if h_sq < 0.0 {
+        return Err("slider position leads to an imaginary crank intersection".to_string());
+    }
+    let mid = pivot + delta * (a / distance);
+    let perp = vec2(-delta.y / distance, delta.x / distance);
+    let h = h_sq.sqrt();
+    let candidate_a = mid + perp * h;
+    let candidate_b = mid - perp * h;
+    let tip = if candidate_a.y >= candidate_b.y {
+        candidate_a
+    } else {
+        candidate_b
+    };
+    let theta = (tip.y - pivot.y).atan2(tip.x - pivot.x);
+    solve_slider_crank_pose(assembly, theta)
+}
+
+fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifact, String> {
+    let Some((drive_id, drive)) = assembly.drives.iter().next() else {
+        return Err("fixture missing drive".to_string());
+    };
+    let plan = drive_plan(&assembly, drive_id, drive)?;
+    let samples = drive.sweep.samples.max(2) as usize;
+
+    let mut frames = Vec::with_capacity(samples);
+    let mut point_paths: BTreeMap<String, Vec<Point2>> = BTreeMap::new();
+
+    for sample_idx in 0..samples {
+        let denom = (samples - 1).max(1) as f32;
+        let base_u = sample_idx as f32 / denom;
+        let drive_value = sample_drive_value(&plan, base_u);
+        let solved = match plan.parameter {
+            DriveParameter::Angle => solve_slider_crank_pose(&assembly, drive_value)?,
+            DriveParameter::SliderPosition => {
+                solve_slider_crank_from_slider(&assembly, drive_value)?
+            }
+        };
+        let poi_positions = solve_poi_positions(&assembly, &solved.joints)?;
+        for (poi_id, position) in &poi_positions {
+            point_paths
+                .entry(poi_id.clone())
+                .or_default()
+                .push(*position);
+        }
+
+        frames.push(SolvedFrame {
+            u: base_u,
+            joint_positions: solved
+                .joints
+                .iter()
+                .map(|(joint_id, joint)| (joint_id.clone(), joint.position))
+                .collect(),
+            drive_values: BTreeMap::from([(plan.drive_id.clone(), drive_value)]),
+            poi_positions,
+        });
+    }
+
+    Ok(SweepArtifact {
+        assembly: Arc::new(assembly),
+        frames,
+        telemetry: SweepTelemetry { point_paths },
+        turn,
+        reset_phase: false,
+        cycle_seconds: plan.cycle_seconds,
+        playback: plan.playback,
+    })
+}
+
+fn solve_poi_positions(
+    assembly: &AssemblySpec,
+    joints: &BTreeMap<String, SolvedJoint>,
+) -> Result<BTreeMap<String, Point2>, String> {
+    let mut positions = BTreeMap::new();
+    for poi in &assembly.points_of_interest {
+        let Some(host_part) = assembly.parts.get(&poi.host) else {
+            return Err(format!("poi {}: missing host part {}", poi.id, poi.host));
+        };
+        let PartSpec::Link { a, b, .. } = host_part else {
+            return Err(format!("poi {}: host {} is not a link", poi.id, poi.host));
+        };
+        let Some(a_joint) = joints.get(a) else {
+            return Err(format!("poi {}: missing host joint {}", poi.id, a));
+        };
+        let Some(b_joint) = joints.get(b) else {
+            return Err(format!("poi {}: missing host joint {}", poi.id, b));
+        };
+        let a_pos = a_joint.position;
+        let b_pos = b_joint.position;
+        let along = b_pos - a_pos;
+        let normal = if along.length_squared() > 0.0 {
+            vec2(-along.y, along.x).normalize()
+        } else {
+            vec2(0.0, 0.0)
+        };
+        let pos = a_pos + along * poi.t + normal * poi.perp;
+        positions.insert(poi.id.clone(), pos);
+    }
+    Ok(positions)
+}
+
+fn drive_plan(
+    assembly: &AssemblySpec,
+    drive_id: &str,
+    drive: &DriveSpec,
+) -> Result<DrivePlan, String> {
+    match &drive.kind {
+        DriveKindSpec::Angular { range, .. } => {
+            let direction = drive.sweep.direction;
+            let (start_value, end_value, playback) = match range {
+                Some([start, end]) => {
+                    if matches!(direction, "CounterClockwise" | "CCW" | "Reverse") {
+                        (*end, *start, PlaybackTraversal::PingPong)
+                    } else {
+                        (*start, *end, PlaybackTraversal::PingPong)
+                    }
+                }
+                None => match direction {
+                    "CounterClockwise" | "CCW" => (0.0, TAU, PlaybackTraversal::Forward),
+                    "Clockwise" | "CW" | "Forward" => (TAU, 0.0, PlaybackTraversal::Forward),
+                    other => {
+                        return Err(format!(
+                            "drive {drive_id}: unsupported angular direction {other}"
+                        ));
+                    }
+                },
+            };
+            Ok(DrivePlan {
+                drive_id: drive_id.to_string(),
+                parameter: DriveParameter::Angle,
+                start_value,
+                end_value,
+                cycle_seconds: 2.0,
+                playback,
+            })
+        }
+        DriveKindSpec::Linear { slider, range } => {
+            let Some(PartSpec::Slider {
+                range: slider_range,
+                ..
+            }) = assembly.parts.get(slider)
+            else {
+                return Err(format!("drive {drive_id}: missing slider part {slider}"));
+            };
+            let [start_value, end_value] = range.unwrap_or(*slider_range);
+            Ok(DrivePlan {
+                drive_id: drive_id.to_string(),
+                parameter: DriveParameter::SliderPosition,
+                start_value,
+                end_value,
+                cycle_seconds: 1.5,
+                playback: PlaybackTraversal::PingPong,
+            })
+        }
+    }
+}
+
+fn sample_drive_value(plan: &DrivePlan, u: f32) -> f32 {
+    let t = playback_sample_u(u, plan.playback);
+    plan.start_value + (plan.end_value - plan.start_value) * t
 }
 
 fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
@@ -635,7 +981,13 @@ fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
     );
     let (spec_rect, render_rect) = content_rects(win);
     draw_spec_pane(draw, spec_rect, fixture, model.spec_scroll_px);
-    draw_render_pane(draw, render_rect, fixture);
+    draw_render_pane(
+        draw,
+        render_rect,
+        fixture,
+        model.playback_phase,
+        model.playback_paused,
+    );
 }
 
 fn draw_menu_layer(
@@ -656,7 +1008,11 @@ fn draw_menu_layer(
         .font_size(9)
         .color(rgba(1.0, 1.0, 1.0, 0.82));
 
-    let mode_label = if headless { "HEADLESS P1" } else { "STATIC P1" };
+    let mode_label = if headless {
+        "HEADLESS P2"
+    } else {
+        "PLAYBACK P2"
+    };
     draw.text(mode_label)
         .x_y(win.right() - 78.0, win.top() - 24.0)
         .font_size(9)
@@ -744,12 +1100,18 @@ fn draw_spec_pane(draw: &Draw, rect: Rect, fixture: &FixturePresentation, scroll
     }
 }
 
-fn draw_render_pane(draw: &Draw, rect: Rect, fixture: &FixturePresentation) {
+fn draw_render_pane(
+    draw: &Draw,
+    rect: Rect,
+    fixture: &FixturePresentation,
+    playback_phase: f32,
+    playback_paused: bool,
+) {
     let text_w = rect.w() - PANE_TEXT_INSET * 2.0;
     let text_x = rect.left() + PANE_TEXT_INSET + text_w * 0.5;
 
     let title = match fixture.status {
-        FixtureStatus::Solved(_) => "STATIC SOLVED ORIGIN",
+        FixtureStatus::Solved(_) => "SWEEP PLAYBACK",
         FixtureStatus::ValidationError(_) => "VALIDATION FAILURE",
         FixtureStatus::SolverError(_) => "SOLVER FAILURE",
     };
@@ -761,7 +1123,13 @@ fn draw_render_pane(draw: &Draw, rect: Rect, fixture: &FixturePresentation) {
         .left_justify();
 
     let subtitle = match fixture.status {
-        FixtureStatus::Solved(_) => "closed-form slider-crank fixture",
+        FixtureStatus::Solved(_) => {
+            if playback_paused {
+                "space resumes playback"
+            } else {
+                "space pauses playback"
+            }
+        }
         FixtureStatus::ValidationError(_) => "validator rejected the selected fixture",
         FixtureStatus::SolverError(_) => "solver could not produce a static origin pose",
     };
@@ -775,9 +1143,41 @@ fn draw_render_pane(draw: &Draw, rect: Rect, fixture: &FixturePresentation) {
     let local_draw = draw.x_y(rect.x(), rect.y() - RENDER_VIEW_Y_OFFSET);
     let local_rect = Rect::from_w_h(rect.w() - 28.0, rect.h() - 72.0);
     match &fixture.status {
-        FixtureStatus::Solved(solved) => {
+        FixtureStatus::Solved(artifact) => {
             draw_grid_local(&local_draw, local_rect);
-            draw_solution_local(&local_draw, local_rect, solved);
+            let sampled_u = playback_sample_u(playback_phase, artifact.playback);
+            let frame = sampled_frame(artifact, sampled_u);
+            let solved = solved_assembly_for_frame(&artifact.assembly, frame);
+            let bounds = artifact_bounds(artifact);
+            let map = make_world_to_local(local_rect, bounds);
+            draw_poi_traces_local(&local_draw, artifact, &map);
+            draw_solution_local(&local_draw, local_rect, &solved, &map);
+            let drive_status = frame
+                .drive_values
+                .iter()
+                .next()
+                .map(|(_, value)| {
+                    let label = match artifact
+                        .assembly
+                        .drives
+                        .values()
+                        .next()
+                        .map(|drive| &drive.kind)
+                    {
+                        Some(DriveKindSpec::Angular { .. }) => "angle",
+                        Some(DriveKindSpec::Linear { .. }) => "slider",
+                        None => "drive",
+                    };
+                    format!("{label} {:.2}", value)
+                })
+                .unwrap_or_else(|| "drive n/a".to_string());
+            let status = format!("u {:.2}  |  {drive_status}", frame.u);
+            draw.text(&status)
+                .x_y(text_x, rect.top() - 50.0)
+                .w_h(text_w, PANE_LINE_H)
+                .font_size(8)
+                .color(rgba(1.0, 1.0, 1.0, 0.34))
+                .left_justify();
         }
         FixtureStatus::ValidationError(message) => {
             draw_error_state(&local_draw, local_rect, "VALIDATOR", message);
@@ -816,25 +1216,10 @@ fn draw_grid_local(draw: &Draw, rect: Rect) {
     }
 }
 
-fn draw_solution_local(draw: &Draw, rect: Rect, solved: &SolvedAssembly) {
-    let bounds = solved_bounds(solved);
-    let pane_w = rect.w() - 120.0;
-    let pane_h = rect.h() - 120.0;
-    let world_w = (bounds.right() - bounds.left()).max(1.0);
-    let world_h = (bounds.top() - bounds.bottom()).max(1.0);
-    let scale = (pane_w / world_w).min(pane_h / world_h);
-    let world_center = pt2(
-        (bounds.left() + bounds.right()) * 0.5,
-        (bounds.bottom() + bounds.top()) * 0.5,
-    );
-
-    let map = |point: Point2| {
-        pt2(
-            (point.x - world_center.x) * scale,
-            (point.y - world_center.y) * scale,
-        )
-    };
-
+fn draw_solution_local<F>(draw: &Draw, _rect: Rect, solved: &SolvedAssembly, map: &F)
+where
+    F: Fn(Point2) -> Point2,
+{
     draw_slider_local(draw, solved, map);
 
     for link in &solved.links {
@@ -863,12 +1248,21 @@ fn draw_solution_local(draw: &Draw, rect: Rect, solved: &SolvedAssembly) {
             draw.ellipse().x_y(p.x, p.y).w_h(12.0, 12.0).color(color);
         }
     }
+
+    for (index, poi) in solved.pois.iter().enumerate() {
+        let p = map(poi.position);
+        draw.ellipse()
+            .x_y(p.x, p.y)
+            .w_h(8.0, 8.0)
+            .color(poi_color(index, 0.92));
+    }
 }
 
 fn draw_error_state(draw: &Draw, rect: Rect, source: &str, message: &str) {
     draw_grid_local(draw, rect);
-    let text_w = rect.w() - 120.0;
+    let text_w = rect.w() - 96.0;
     let text_x = rect.left() + 28.0 + text_w * 0.5;
+    let body_h = 108.0;
 
     draw.text(source)
         .x_y(text_x, rect.top() - 36.0)
@@ -878,52 +1272,238 @@ fn draw_error_state(draw: &Draw, rect: Rect, source: &str, message: &str) {
         .left_justify();
 
     draw.text(message)
-        .x_y(text_x, rect.top() - 62.0)
-        .w_h(text_w, 64.0)
+        .x_y(text_x, rect.top() - 86.0)
+        .w_h(text_w, body_h)
         .font_size(8)
         .color(rgba(1.0, 1.0, 1.0, 0.70))
         .left_justify();
 }
 
-fn draw_slider_local<F>(draw: &Draw, solved: &SolvedAssembly, map: F)
+fn draw_slider_local<F>(draw: &Draw, solved: &SolvedAssembly, map: &F)
 where
     F: Fn(Point2) -> Point2,
 {
     let start = map(solved.slider.start);
     let end = map(solved.slider.end);
-    let dash_count = 18;
-    for dash in 0..dash_count {
-        if dash % 2 == 1 {
-            continue;
-        }
-        let t0 = dash as f32 / dash_count as f32;
-        let t1 = (dash + 1) as f32 / dash_count as f32;
-        let p0 = start.lerp(end, t0);
-        let p1 = start.lerp(end, t1);
-        draw.line()
-            .start(p0)
-            .end(p1)
-            .weight(1.0)
-            .color(rgba(1.0, 1.0, 1.0, 0.32));
-    }
+    let center = pt2((start.x + end.x) * 0.5, (start.y + end.y) * 0.5);
+    let track_w = (end.x - start.x).abs();
+    let outer_h = 22.0;
+    let inner_h = 12.0;
+    let outer_w = track_w.max(outer_h);
+    let inner_w = track_w.max(inner_h);
 
-    let cap = 8.0;
-    draw.line()
-        .start(pt2(start.x, start.y - cap))
-        .end(pt2(start.x, start.y + cap))
-        .weight(1.0)
-        .color(rgba(1.0, 1.0, 1.0, 0.40));
-    draw.line()
-        .start(pt2(end.x, end.y - cap))
-        .end(pt2(end.x, end.y + cap))
-        .weight(1.0)
-        .color(rgba(1.0, 1.0, 1.0, 0.40));
+    draw.rect()
+        .x_y(center.x, center.y)
+        .w_h(outer_w, outer_h)
+        .color(rgba(1.0, 1.0, 1.0, 0.22));
+    draw.ellipse()
+        .x_y(start.x, start.y)
+        .w_h(outer_h, outer_h)
+        .color(rgba(1.0, 1.0, 1.0, 0.22));
+    draw.ellipse()
+        .x_y(end.x, end.y)
+        .w_h(outer_h, outer_h)
+        .color(rgba(1.0, 1.0, 1.0, 0.22));
+
+    draw.rect()
+        .x_y(center.x, center.y)
+        .w_h(inner_w, inner_h)
+        .color(rgba(0.02, 0.025, 0.035, 1.0));
+    draw.ellipse()
+        .x_y(start.x, start.y)
+        .w_h(inner_h, inner_h)
+        .color(rgba(0.02, 0.025, 0.035, 1.0));
+    draw.ellipse()
+        .x_y(end.x, end.y)
+        .w_h(inner_h, inner_h)
+        .color(rgba(0.02, 0.025, 0.035, 1.0));
 
     let slider_joint = map(solved.joints[&solved.slider.joint].position);
-    draw.rect()
+    draw.ellipse()
         .x_y(slider_joint.x, slider_joint.y)
-        .w_h(16.0, 10.0)
-        .color(rgba(0.34, 0.78, 0.98, 0.22));
+        .w_h(12.0, 12.0)
+        .color(rgba(1.0, 1.0, 1.0, 0.92));
+}
+
+fn playback_sample_u(phase: f32, traversal: PlaybackTraversal) -> f32 {
+    match traversal {
+        PlaybackTraversal::Forward => phase,
+        PlaybackTraversal::PingPong => 0.5 - 0.5 * (phase * TAU).cos(),
+    }
+}
+
+fn sampled_frame(artifact: &SweepArtifact, sample_u: f32) -> &SolvedFrame {
+    let len = artifact.frames.len().max(1);
+    let idx = ((sample_u.clamp(0.0, 0.999_999)) * len as f32).floor() as usize;
+    &artifact.frames[idx.min(len - 1)]
+}
+
+fn solved_assembly_for_frame(assembly: &AssemblySpec, frame: &SolvedFrame) -> SolvedAssembly {
+    let joints = assembly
+        .joints
+        .iter()
+        .filter_map(|(joint_id, joint_spec)| {
+            frame.joint_positions.get(joint_id).map(|position| {
+                (
+                    joint_id.clone(),
+                    SolvedJoint {
+                        position: *position,
+                        fixed: matches!(joint_spec, JointSpec::Fixed { .. }),
+                    },
+                )
+            })
+        })
+        .collect();
+
+    let links = assembly
+        .parts
+        .iter()
+        .filter_map(|(_, part)| match part {
+            PartSpec::Link { a, b, .. } => Some(SolvedLink {
+                a: a.clone(),
+                b: b.clone(),
+            }),
+            PartSpec::Slider { .. } => None,
+        })
+        .collect();
+
+    let slider = assembly
+        .parts
+        .values()
+        .find_map(|part| match part {
+            PartSpec::Slider {
+                joint,
+                axis_origin,
+                axis_dir,
+                range,
+            } => Some(SolvedSlider {
+                start: pt2(
+                    axis_origin[0] + axis_dir[0] * range[0],
+                    axis_origin[1] + axis_dir[1] * range[0],
+                ),
+                end: pt2(
+                    axis_origin[0] + axis_dir[0] * range[1],
+                    axis_origin[1] + axis_dir[1] * range[1],
+                ),
+                joint: joint.clone(),
+            }),
+            PartSpec::Link { .. } => None,
+        })
+        .expect("solved frame requires one slider track");
+
+    let pois = frame
+        .poi_positions
+        .iter()
+        .map(|(_, position)| SolvedPoi {
+            position: *position,
+        })
+        .collect();
+
+    SolvedAssembly {
+        joints,
+        links,
+        slider,
+        pois,
+    }
+}
+
+fn artifact_bounds(artifact: &SweepArtifact) -> Rect {
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for frame in &artifact.frames {
+        for position in frame.joint_positions.values() {
+            min_x = min_x.min(position.x);
+            max_x = max_x.max(position.x);
+            min_y = min_y.min(position.y);
+            max_y = max_y.max(position.y);
+        }
+        for position in frame.poi_positions.values() {
+            min_x = min_x.min(position.x);
+            max_x = max_x.max(position.x);
+            min_y = min_y.min(position.y);
+            max_y = max_y.max(position.y);
+        }
+    }
+
+    for part in artifact.assembly.parts.values() {
+        if let PartSpec::Slider {
+            axis_origin,
+            axis_dir,
+            range,
+            ..
+        } = part
+        {
+            let start = pt2(
+                axis_origin[0] + axis_dir[0] * range[0],
+                axis_origin[1] + axis_dir[1] * range[0],
+            );
+            let end = pt2(
+                axis_origin[0] + axis_dir[0] * range[1],
+                axis_origin[1] + axis_dir[1] * range[1],
+            );
+            min_x = min_x.min(start.x).min(end.x);
+            max_x = max_x.max(start.x).max(end.x);
+            min_y = min_y.min(start.y).min(end.y);
+            max_y = max_y.max(start.y).max(end.y);
+        }
+    }
+
+    Rect::from_corners(
+        pt2(min_x - 20.0, min_y - 20.0),
+        pt2(max_x + 20.0, max_y + 20.0),
+    )
+}
+
+fn make_world_to_local(rect: Rect, bounds: Rect) -> impl Fn(Point2) -> Point2 {
+    let pane_w = rect.w() - 120.0;
+    let pane_h = rect.h() - 120.0;
+    let world_w = (bounds.right() - bounds.left()).max(1.0);
+    let world_h = (bounds.top() - bounds.bottom()).max(1.0);
+    let scale = (pane_w / world_w).min(pane_h / world_h);
+    let world_center = pt2(
+        (bounds.left() + bounds.right()) * 0.5,
+        (bounds.bottom() + bounds.top()) * 0.5,
+    );
+    move |point: Point2| {
+        pt2(
+            (point.x - world_center.x) * scale,
+            (point.y - world_center.y) * scale,
+        )
+    }
+}
+
+fn draw_poi_traces_local<F>(draw: &Draw, artifact: &SweepArtifact, map: &F)
+where
+    F: Fn(Point2) -> Point2,
+{
+    for (index, path) in artifact.telemetry.point_paths.values().enumerate() {
+        for (point_index, window) in path.windows(2).enumerate() {
+            if point_index % 2 == 1 {
+                continue;
+            }
+            let a = map(window[0]);
+            let b = map(window[1]);
+            draw.line()
+                .start(a)
+                .end(b)
+                .weight(1.0)
+                .color(poi_color(index, 0.72));
+        }
+    }
+}
+
+fn poi_color(index: usize, alpha: f32) -> LinSrgba {
+    const PALETTE: [(f32, f32, f32); 4] = [
+        (0.34, 0.78, 0.98),
+        (0.98, 0.68, 0.28),
+        (0.70, 0.88, 0.36),
+        (0.96, 0.46, 0.70),
+    ];
+    let (r, g, b) = PALETTE[index % PALETTE.len()];
+    rgba(r, g, b, alpha).into_linear()
 }
 
 fn wait_for_capture_flush(path: &PathBuf) -> bool {
@@ -994,25 +1574,99 @@ fn content_rects(win: Rect) -> (Rect, Rect) {
     (spec_rect, render_rect)
 }
 
-fn solved_bounds(solved: &SolvedAssembly) -> Rect {
-    let mut min_x = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for joint in solved.joints.values() {
-        min_x = min_x.min(joint.position.x);
-        max_x = max_x.max(joint.position.x);
-        min_y = min_y.min(joint.position.y);
-        max_y = max_y.max(joint.position.y);
+    #[test]
+    fn slider_crank_sweep_frames_are_deterministic() {
+        let first = build_sweep_artifact(slider_crank_fixture(), 1).expect("first sweep");
+        let second = build_sweep_artifact(slider_crank_fixture(), 1).expect("second sweep");
+        assert_eq!(
+            frame_signature(&first.frames),
+            frame_signature(&second.frames)
+        );
     }
-    min_x = min_x.min(solved.slider.start.x);
-    max_x = max_x.max(solved.slider.end.x);
-    min_y = min_y.min(solved.slider.start.y);
-    max_y = max_y.max(solved.slider.end.y);
 
-    Rect::from_corners(
-        pt2(min_x - 20.0, min_y - 20.0),
-        pt2(max_x + 20.0, max_y + 20.0),
-    )
+    #[test]
+    fn full_clockwise_angular_drive_spans_full_rotation() {
+        let assembly = slider_crank_fixture();
+        let (drive_id, drive) = assembly.drives.iter().next().expect("drive");
+        let plan = drive_plan(&assembly, drive_id, drive).expect("drive plan");
+        assert!(matches!(plan.parameter, DriveParameter::Angle));
+        assert!(matches!(plan.playback, PlaybackTraversal::Forward));
+        assert_eq!(plan.start_value.to_bits(), TAU.to_bits());
+        assert_eq!(plan.end_value.to_bits(), 0.0f32.to_bits());
+        assert_eq!(plan.cycle_seconds.to_bits(), 2.0f32.to_bits());
+    }
+
+    #[test]
+    fn interval_drive_ping_pong_eases_at_the_turnarounds() {
+        let mut assembly = slider_crank_fixture();
+        if let Some(DriveSpec {
+            kind: DriveKindSpec::Angular { range, .. },
+            ..
+        }) = assembly.drives.get_mut("d_crank")
+        {
+            *range = Some([0.25, 1.25]);
+        } else {
+            panic!("fixture missing angular drive");
+        }
+
+        let (drive_id, drive) = assembly.drives.iter().next().expect("drive");
+        let plan = drive_plan(&assembly, drive_id, drive).expect("drive plan");
+        assert!(matches!(plan.playback, PlaybackTraversal::PingPong));
+        assert_eq!(sample_drive_value(&plan, 0.0).to_bits(), 0.25f32.to_bits());
+        assert!((sample_drive_value(&plan, 0.5) - 1.25).abs() < 0.000_1);
+        assert!((sample_drive_value(&plan, 1.0) - 0.25).abs() < 0.000_1);
+        let early = sample_drive_value(&plan, 0.05) - 0.25;
+        let middle = sample_drive_value(&plan, 0.30) - sample_drive_value(&plan, 0.25);
+        assert!(early < middle);
+    }
+
+    #[test]
+    fn linear_drive_defaults_to_slider_range_and_ping_pongs() {
+        let mut assembly = slider_crank_fixture();
+        assembly.drives.insert(
+            "d_slide".to_string(),
+            DriveSpec {
+                kind: DriveKindSpec::Linear {
+                    slider: "s_track".to_string(),
+                    range: None,
+                },
+                sweep: SweepSpec {
+                    samples: 48,
+                    direction: "Forward",
+                },
+            },
+        );
+        assembly.drives.remove("d_crank");
+
+        let (drive_id, drive) = assembly.drives.iter().next().expect("drive");
+        let plan = drive_plan(&assembly, drive_id, drive).expect("drive plan");
+        assert!(matches!(plan.parameter, DriveParameter::SliderPosition));
+        assert!(matches!(plan.playback, PlaybackTraversal::PingPong));
+        assert_eq!(plan.start_value.to_bits(), (-20.0f32).to_bits());
+        assert_eq!(plan.end_value.to_bits(), 180.0f32.to_bits());
+        assert_eq!(plan.cycle_seconds.to_bits(), 1.5f32.to_bits());
+    }
+
+    fn frame_signature(frames: &[SolvedFrame]) -> Vec<u32> {
+        let mut signature = Vec::new();
+        for frame in frames {
+            signature.push(frame.u.to_bits());
+            for position in frame.joint_positions.values() {
+                signature.push(position.x.to_bits());
+                signature.push(position.y.to_bits());
+            }
+            for value in frame.drive_values.values() {
+                signature.push(value.to_bits());
+            }
+            for position in frame.poi_positions.values() {
+                signature.push(position.x.to_bits());
+                signature.push(position.y.to_bits());
+            }
+        }
+        signature
+    }
 }
