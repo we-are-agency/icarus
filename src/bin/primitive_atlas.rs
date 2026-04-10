@@ -880,7 +880,9 @@ fn render_shader_pass(
 
     let mut encoder = frame.command_encoder();
     let mut render_pass = wgpu::RenderPassBuilder::new()
-        .color_attachment(frame.texture_view(), |color| color.load_op(wgpu::LoadOp::Load))
+        .color_attachment(frame.texture_view(), |color| {
+            color.load_op(wgpu::LoadOp::Load)
+        })
         .begin(&mut encoder);
     render_pass.set_scissor_rect(sx, sy, sw, sh);
     render_pass.set_pipeline(&shader_pass.pipeline);
@@ -905,7 +907,9 @@ fn render_textured_shader_pass(
 
     let mut encoder = frame.command_encoder();
     let mut render_pass = wgpu::RenderPassBuilder::new()
-        .color_attachment(frame.texture_view(), |color| color.load_op(wgpu::LoadOp::Load))
+        .color_attachment(frame.texture_view(), |color| {
+            color.load_op(wgpu::LoadOp::Load)
+        })
         .begin(&mut encoder);
     render_pass.set_scissor_rect(sx, sy, sw, sh);
     render_pass.set_pipeline(&shader_pass.pipeline);
@@ -1008,7 +1012,10 @@ fn draw_header(draw: &Draw, win: Rect, screen: ScreenKind) {
         .font_size(12)
         .color(ui_color(MUTED));
 
-    let page_idx = SCREENS.iter().position(|candidate| *candidate == screen).unwrap_or(0);
+    let page_idx = SCREENS
+        .iter()
+        .position(|candidate| *candidate == screen)
+        .unwrap_or(0);
     let current_x = win.right() - OUTER_MARGIN - 124.0;
     let current_y = top - 80.0;
 
@@ -1550,14 +1557,15 @@ fn draw_chladni_visual(draw: &Draw, rect: Rect, time: f32) {
             let x = map_range(px, rect.left(), rect.right(), -PI, PI);
             let y = map_range(py, rect.bottom(), rect.top(), -PI, PI);
             let field =
-                ((a * x).sin() * (b * y).sin() - (c * x + time * 0.3).cos() * (d * y).sin())
-                    .abs();
+                ((a * x).sin() * (b * y).sin() - (c * x + time * 0.3).cos() * (d * y).sin()).abs();
             if field < threshold {
                 let alpha = map_range(field, 0.0, threshold, 0.98, 0.08);
-                draw.ellipse()
-                    .x_y(px, py)
-                    .w_h(3.0, 3.0)
-                    .color(hsla(0.15 + 0.45 * (x * y).sin().abs(), 0.72, 0.68, alpha));
+                draw.ellipse().x_y(px, py).w_h(3.0, 3.0).color(hsla(
+                    0.15 + 0.45 * (x * y).sin().abs(),
+                    0.72,
+                    0.68,
+                    alpha,
+                ));
             }
         }
     }
@@ -1570,8 +1578,7 @@ fn draw_neurons_visual(draw: &Draw, rect: Rect, time: f32) {
         let angle = fi * 0.63 + time * 0.12;
         let radial = 0.24 + 0.56 * ((fi * 1.37 + time * 0.18).sin() * 0.5 + 0.5);
         let x = angle.cos() * rect.w() * radial * 0.46 + (fi * 0.91 + time * 0.38).sin() * 48.0;
-        let y =
-            angle.sin() * rect.h() * radial * 0.34 + (fi * 1.27 + time * 0.26).cos() * 34.0;
+        let y = angle.sin() * rect.h() * radial * 0.34 + (fi * 1.27 + time * 0.26).cos() * 34.0;
         nodes.push(pt2(x, y));
     }
 
@@ -1585,7 +1592,12 @@ fn draw_neurons_visual(draw: &Draw, rect: Rect, time: f32) {
                 draw.line()
                     .points(a, b)
                     .weight(1.0 + link * 2.2)
-                    .color(hsla(0.56 + 0.08 * (i as f32).sin(), 0.70, 0.62, 0.08 + 0.22 * link));
+                    .color(hsla(
+                        0.56 + 0.08 * (i as f32).sin(),
+                        0.70,
+                        0.62,
+                        0.08 + 0.22 * link,
+                    ));
 
                 let pulse = ((time * 0.7 + i as f32 * 0.17 + j as f32 * 0.11).sin() * 0.5 + 0.5)
                     .clamp(0.0, 1.0);
@@ -1604,10 +1616,12 @@ fn draw_neurons_visual(draw: &Draw, rect: Rect, time: f32) {
             .x_y(node.x, node.y)
             .w_h(glow * 2.0, glow * 2.0)
             .color(hsla(0.58, 0.56, 0.54, 0.08));
-        draw.ellipse()
-            .x_y(node.x, node.y)
-            .w_h(8.0, 8.0)
-            .color(hsla(0.14 + 0.42 * hash01(idx as f32), 0.82, 0.72, 0.94));
+        draw.ellipse().x_y(node.x, node.y).w_h(8.0, 8.0).color(hsla(
+            0.14 + 0.42 * hash01(idx as f32),
+            0.82,
+            0.72,
+            0.94,
+        ));
     }
 }
 
@@ -1663,15 +1677,12 @@ fn draw_sinh_visual(draw: &Draw, rect: Rect, time: f32) {
             let py = offset + y * rect.h() * 0.18;
             let point = pt2(px, py);
             if let Some(last) = prev {
-                draw.line()
-                    .points(last, point)
-                    .weight(1.2)
-                    .color(hsla(
-                        0.58 + 0.12 * (band as f32 * 0.17).sin(),
-                        0.62,
-                        0.58,
-                        0.12,
-                    ));
+                draw.line().points(last, point).weight(1.2).color(hsla(
+                    0.58 + 0.12 * (band as f32 * 0.17).sin(),
+                    0.62,
+                    0.58,
+                    0.12,
+                ));
             }
             prev = Some(point);
         }
@@ -1719,7 +1730,12 @@ fn draw_darkclouds_visual(draw: &Draw, rect: Rect, time: f32) {
             draw.rect()
                 .x_y(px, py)
                 .w_h(cell_w + 1.0, cell_h + 1.0)
-                .color(hsla(0.60 - density * 0.08, 0.26 + density * 0.18, lit, alpha));
+                .color(hsla(
+                    0.60 - density * 0.08,
+                    0.26 + density * 0.18,
+                    lit,
+                    alpha,
+                ));
         }
     }
 }
@@ -1740,11 +1756,12 @@ fn draw_mandelbulb_visual(draw: &Draw, rect: Rect, time: f32) {
             let y = radius * phi.sin();
             let z = radius * phi.cos() * theta.sin();
             let size = 1.8 + 3.0 * wave;
-            scene
-                .ellipse()
-                .x_y_z(x, y, z)
-                .w_h(size, size)
-                .color(hsla(0.08 + wave * 0.18, 0.82, 0.62, 0.10 + wave * 0.38));
+            scene.ellipse().x_y_z(x, y, z).w_h(size, size).color(hsla(
+                0.08 + wave * 0.18,
+                0.82,
+                0.62,
+                0.10 + wave * 0.38,
+            ));
         }
     }
 }
@@ -1816,10 +1833,12 @@ fn draw_winterflake_visual(draw: &Draw, rect: Rect, time: f32) {
         let fall = (time * (8.0 + hash01(fi * 1.13) * 20.0) + fi * 1.7).rem_euclid(rect.h());
         let y = rect.top() - fall;
         let size = 1.0 + hash01(fi * 0.27) * 2.4;
-        draw.ellipse()
-            .x_y(x, y)
-            .w_h(size, size)
-            .color(srgba(0.94, 0.97, 1.0, 0.18 + hash01(fi * 0.81) * 0.36));
+        draw.ellipse().x_y(x, y).w_h(size, size).color(srgba(
+            0.94,
+            0.97,
+            1.0,
+            0.18 + hash01(fi * 0.81) * 0.36,
+        ));
     }
 }
 
@@ -1844,10 +1863,12 @@ fn draw_gpuattractor_visual(draw: &Draw, rect: Rect, time: f32) {
         let px = x * rect.w() * 0.16;
         let py = y * rect.h() * 0.16;
         let alpha = 0.04 + 0.18 * ((i as f32 / 8000.0).powf(0.35));
-        draw.ellipse()
-            .x_y(px, py)
-            .w_h(1.6, 1.6)
-            .color(hsla(0.56 + 0.18 * y.sin().abs(), 0.82, 0.66, alpha));
+        draw.ellipse().x_y(px, py).w_h(1.6, 1.6).color(hsla(
+            0.56 + 0.18 * y.sin().abs(),
+            0.82,
+            0.66,
+            alpha,
+        ));
     }
 }
 
@@ -1880,10 +1901,12 @@ fn draw_branch(draw: &Draw, start: Point2, end: Point2, depth: u32, time: f32, w
         .color(hsla(0.10 + t * 0.20, 0.54, 0.28 + t * 0.18, 0.95));
 
     if depth == 0 {
-        draw.ellipse()
-            .x_y(end.x, end.y)
-            .w_h(6.0, 6.0)
-            .color(hsla(0.28 + 0.12 * (time * 0.4).sin().abs(), 0.62, 0.62, 0.82));
+        draw.ellipse().x_y(end.x, end.y).w_h(6.0, 6.0).color(hsla(
+            0.28 + 0.12 * (time * 0.4).sin().abs(),
+            0.62,
+            0.62,
+            0.82,
+        ));
         return;
     }
 

@@ -1,9 +1,9 @@
-use nannou::image::{DynamicImage, ImageBuffer, Rgba};
-use nannou::prelude::*;
 use icarus::analysis::{CQT_BINS, CQT_HISTORY, FFT_DISPLAY_BINS, FFT_HISTORY};
 use icarus::audio::{AudioCapture, FFT_SIZE};
 use icarus::midi_layer::MidiLayer;
 use icarus::transcription::{InstrumentSelection, StreamingTranscriber, TRANSCRIPTION_HOP_SIZE};
+use nannou::image::{DynamicImage, ImageBuffer, Rgba};
+use nannou::prelude::*;
 use std::collections::VecDeque;
 
 const MENU_BAR_H: f32 = 56.0;
@@ -313,8 +313,14 @@ fn draw_menu_layer(draw: &Draw, win: Rect, model: &Model) {
 
         if item.active && is_selected {
             draw.line()
-                .start(pt2(item_x - estimated_w * 0.5, indicator_y - indicator_h * 0.5))
-                .end(pt2(item_x + estimated_w * 0.5, indicator_y - indicator_h * 0.5))
+                .start(pt2(
+                    item_x - estimated_w * 0.5,
+                    indicator_y - indicator_h * 0.5,
+                ))
+                .end(pt2(
+                    item_x + estimated_w * 0.5,
+                    indicator_y - indicator_h * 0.5,
+                ))
                 .color(rgba(1.0, 1.0, 1.0, 0.95))
                 .weight(2.0);
         }
@@ -566,7 +572,6 @@ fn draw_analysis_scaffold(draw: &Draw, model: &Model, frame: &Frame, win: Rect) 
                 .color(rgba(1.0_f32, 1.0, 1.0, 0.35));
         }
     }
-
 }
 
 fn draw_instrument_selection_notes(

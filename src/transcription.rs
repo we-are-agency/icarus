@@ -1,8 +1,6 @@
 #![allow(dead_code)]
 
-use crate::analysis::{
-    AudioFeatures, Analyser, CQT_BINS, midi_note_to_cqt_bin,
-};
+use crate::analysis::{Analyser, AudioFeatures, CQT_BINS, midi_note_to_cqt_bin};
 use crate::audio::FFT_SIZE;
 use midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 use serde::Serialize;
@@ -578,7 +576,10 @@ impl RealtimeTranscriber {
         }
         self.finished_notes
             .sort_by(|a, b| note_order(&a.note, &b.note));
-        self.finished_notes.into_iter().map(|completed| completed.note).collect()
+        self.finished_notes
+            .into_iter()
+            .map(|completed| completed.note)
+            .collect()
     }
 
     fn push_finished_note(
@@ -767,12 +768,11 @@ impl RealtimeTranscriber {
         let immediate_floor = floor * (0.92 + 0.08 * collapse_penalty);
         let pending_floor = floor * (0.66 + 0.06 * collapse_penalty);
         let onset_ok = features.onset_confidence >= HARMONIC_IMMEDIATE_ONSET_CONFIDENCE;
-        let sustained_ok =
-            features.harmonic_confidence >= HARMONIC_STRONG_SUSTAIN_CONFIDENCE
-                || features.pitched_stability >= HARMONIC_STRONG_SUSTAIN_CONFIDENCE;
-        let moderate_support =
-            features.onset_confidence >= 0.06 || features.harmonic_confidence >= 0.20
-                || features.pitched_stability >= 0.20;
+        let sustained_ok = features.harmonic_confidence >= HARMONIC_STRONG_SUSTAIN_CONFIDENCE
+            || features.pitched_stability >= HARMONIC_STRONG_SUSTAIN_CONFIDENCE;
+        let moderate_support = features.onset_confidence >= 0.06
+            || features.harmonic_confidence >= 0.20
+            || features.pitched_stability >= 0.20;
 
         if candidate.absolute_strength >= immediate_floor
             && candidate.local_contrast >= HARMONIC_IMMEDIATE_CONTRAST_MIN
@@ -887,13 +887,14 @@ impl RealtimeTranscriber {
         let mut pending_candidates = std::mem::take(&mut self.pending_candidates);
 
         for candidate in candidates {
-            let Some((_, pending)) = pending_candidates
-                .iter_mut()
-                .enumerate()
-                .find(|(_, pending)| {
-                    semitone_distance(pending.midi_note, candidate.midi_note)
-                        <= NOTE_RELOCK_DISTANCE
-                })
+            let Some((_, pending)) =
+                pending_candidates
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, pending)| {
+                        semitone_distance(pending.midi_note, candidate.midi_note)
+                            <= NOTE_RELOCK_DISTANCE
+                    })
             else {
                 pending_candidates.push(PendingHarmonicCandidate {
                     midi_note: candidate.midi_note,
@@ -978,9 +979,9 @@ impl RealtimeTranscriber {
         } else {
             1.0
         };
-        let peak_collapse =
-            ((NORMALIZATION_COLLAPSE_PEAK_RATIO - peak_ratio) / NORMALIZATION_COLLAPSE_PEAK_RATIO)
-                .max(0.0);
+        let peak_collapse = ((NORMALIZATION_COLLAPSE_PEAK_RATIO - peak_ratio)
+            / NORMALIZATION_COLLAPSE_PEAK_RATIO)
+            .max(0.0);
         let total_collapse = ((NORMALIZATION_COLLAPSE_TOTAL_RATIO - total_ratio)
             / NORMALIZATION_COLLAPSE_TOTAL_RATIO)
             .max(0.0);
@@ -991,8 +992,11 @@ impl RealtimeTranscriber {
     }
 
     fn update_salience_references(&mut self, stats: SalienceFrameStats) {
-        self.peak_salience_ref =
-            update_reference_envelope(self.peak_salience_ref, stats.global_peak, HARMONIC_REFERENCE_DECAY);
+        self.peak_salience_ref = update_reference_envelope(
+            self.peak_salience_ref,
+            stats.global_peak,
+            HARMONIC_REFERENCE_DECAY,
+        );
         self.total_salience_ref = update_reference_envelope(
             self.total_salience_ref,
             stats.total_energy,
@@ -1075,21 +1079,15 @@ impl RealtimeTranscriber {
         {
             self.push_drum_note(DRUM_HIHAT_NOTE, 0.82, start_secs, 2);
         }
-        if !kick
-            && !snare
-            && !hihat
-            && onset_confidence >= 0.52
-            && percussive_confidence >= 0.55
-        {
-            let (note, brightness, class_idx) = if kick_strength >= snare_strength
-                && kick_strength >= hihat_strength
-            {
-                (DRUM_KICK_NOTE, 0.18, 0)
-            } else if snare_strength >= hihat_strength {
-                (DRUM_SNARE_NOTE, 0.45, 1)
-            } else {
-                (DRUM_HIHAT_NOTE, 0.82, 2)
-            };
+        if !kick && !snare && !hihat && onset_confidence >= 0.52 && percussive_confidence >= 0.55 {
+            let (note, brightness, class_idx) =
+                if kick_strength >= snare_strength && kick_strength >= hihat_strength {
+                    (DRUM_KICK_NOTE, 0.18, 0)
+                } else if snare_strength >= hihat_strength {
+                    (DRUM_SNARE_NOTE, 0.45, 1)
+                } else {
+                    (DRUM_HIHAT_NOTE, 0.82, 2)
+                };
             if self.drum_cooldowns[class_idx] <= 0.0 {
                 self.push_drum_note(note, brightness, start_secs, class_idx);
             }
@@ -1663,15 +1661,17 @@ fn evaluate_source_separated_detailed_with_labels(
 
     let mut resolved_sources = Vec::with_capacity(references.len());
     for (source_id, reference_notes) in references.iter().enumerate() {
-        let source = per_source[source_id].clone().unwrap_or_else(|| SourceDiagnostic {
-            source_id,
-            label: source_labels
-                .get(source_id)
-                .cloned()
-                .unwrap_or_else(|| format!("source_{source_id}")),
-            stream_id: None,
-            diagnostics: evaluate_notes_detailed(&[], reference_notes),
-        });
+        let source = per_source[source_id]
+            .clone()
+            .unwrap_or_else(|| SourceDiagnostic {
+                source_id,
+                label: source_labels
+                    .get(source_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("source_{source_id}")),
+                stream_id: None,
+                diagnostics: evaluate_notes_detailed(&[], reference_notes),
+            });
         resolved_sources.push(source);
     }
 
@@ -1778,8 +1778,7 @@ fn classify_matched_bucket(
         return FailureBucket::Correct;
     }
 
-    if assessment.pitch_error_semitones >= 11.5
-        && (assessment.pitch_error_semitones % 12.0) <= 0.5
+    if assessment.pitch_error_semitones >= 11.5 && (assessment.pitch_error_semitones % 12.0) <= 0.5
     {
         return FailureBucket::OctaveError;
     }
@@ -1806,9 +1805,9 @@ fn classify_unmatched_predicted_bucket(
     predicted: &TranscribedNote,
     reference_notes: &[GroundTruthNote],
 ) -> FailureBucket {
-    let overlaps_same_pitch = reference_notes
-        .iter()
-        .any(|reference| reference.midi_note == predicted.midi_note && notes_overlap(predicted, reference));
+    let overlaps_same_pitch = reference_notes.iter().any(|reference| {
+        reference.midi_note == predicted.midi_note && notes_overlap(predicted, reference)
+    });
     if overlaps_same_pitch {
         FailureBucket::SplitLikely
     } else {
@@ -1820,9 +1819,9 @@ fn classify_unmatched_reference_bucket(
     reference: &GroundTruthNote,
     predicted_notes: &[TranscribedNote],
 ) -> FailureBucket {
-    let overlaps_same_pitch = predicted_notes
-        .iter()
-        .any(|predicted| predicted.midi_note == reference.midi_note && notes_overlap(predicted, reference));
+    let overlaps_same_pitch = predicted_notes.iter().any(|predicted| {
+        predicted.midi_note == reference.midi_note && notes_overlap(predicted, reference)
+    });
     if overlaps_same_pitch {
         FailureBucket::MergeLikely
     } else {
@@ -2023,9 +2022,7 @@ fn select_note_activations(
         .copied()
         .fold(0.0f32, f32::max);
     let mut peaks = Vec::new();
-    for midi_note in
-        TRANSCRIPTION_MIDI_LOW.max(22)..=TRANSCRIPTION_MIDI_HIGH.saturating_sub(1)
-    {
+    for midi_note in TRANSCRIPTION_MIDI_LOW.max(22)..=TRANSCRIPTION_MIDI_HIGH.saturating_sub(1) {
         let idx = midi_note as usize;
         let center = salience[idx];
         let absolute_center = absolute_strength[idx];
@@ -2475,8 +2472,11 @@ pub fn build_standardized_evaluation_report(
                 .iter()
                 .map(|&pair_idx| pairs[pair_idx].pair.stem.clone())
                 .collect();
-            let detailed =
-                evaluate_source_separated_detailed_with_labels(&predicted, &references, &source_labels);
+            let detailed = evaluate_source_separated_detailed_with_labels(
+                &predicted,
+                &references,
+                &source_labels,
+            );
             cases.push(EvaluationCaseReport {
                 label: mix_label(&pairs, mix_indices),
                 kind: match mix_count {
@@ -2705,7 +2705,10 @@ fn single_source_tags(pair: &LoadedPair) -> Vec<String> {
         tags.push("single_polyphonic".to_owned());
     }
     let stem = pair.pair.stem.to_ascii_lowercase();
-    if PERCUSSION_KEYWORDS.iter().any(|keyword| stem.contains(keyword)) {
+    if PERCUSSION_KEYWORDS
+        .iter()
+        .any(|keyword| stem.contains(keyword))
+    {
         tags.push("single_percussive".to_owned());
     } else {
         tags.push("single_pitched".to_owned());
@@ -2865,7 +2868,11 @@ mod tests {
         ];
 
         let diagnostics = evaluate_notes_detailed(&predicted, &reference);
-        let buckets: HashSet<_> = diagnostics.events.iter().map(|event| event.bucket).collect();
+        let buckets: HashSet<_> = diagnostics
+            .events
+            .iter()
+            .map(|event| event.bucket)
+            .collect();
         assert!(buckets.contains(&FailureBucket::OctaveError));
         assert!(buckets.contains(&FailureBucket::PitchError));
         assert!(buckets.contains(&FailureBucket::ExtraNote));
@@ -3072,8 +3079,18 @@ mod tests {
         );
 
         assert_eq!(transcriber.active_notes.len(), 2);
-        assert!(transcriber.active_notes.iter().any(|note| note.midi_note == 60));
-        assert!(transcriber.active_notes.iter().any(|note| note.midi_note == 62));
+        assert!(
+            transcriber
+                .active_notes
+                .iter()
+                .any(|note| note.midi_note == 60)
+        );
+        assert!(
+            transcriber
+                .active_notes
+                .iter()
+                .any(|note| note.midi_note == 62)
+        );
     }
 
     #[test]
@@ -3143,10 +3160,7 @@ mod tests {
 
         assert_eq!(transcriber.active_notes.len(), 1);
         assert!(transcriber.pending_candidates.is_empty());
-        assert!(matches!(
-            transcriber.active_notes[0].midi_note,
-            60 | 61
-        ));
+        assert!(matches!(transcriber.active_notes[0].midi_note, 60 | 61));
     }
 
     #[test]
@@ -3204,7 +3218,10 @@ mod tests {
         transcriber.analyser.features.brightness = 0.83;
         transcriber.emit_percussive_notes(0.0);
         assert_eq!(transcriber.finished_notes.len(), 1);
-        assert_eq!(transcriber.finished_notes[0].note.midi_note, DRUM_HIHAT_NOTE);
+        assert_eq!(
+            transcriber.finished_notes[0].note.midi_note,
+            DRUM_HIHAT_NOTE
+        );
     }
 
     #[test]

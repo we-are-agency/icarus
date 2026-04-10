@@ -100,8 +100,11 @@ impl MidiLayer {
         selection: Option<InstrumentSelection>,
     ) -> Vec<DrawNote> {
         let cutoff = self.elapsed_secs - self.history_secs;
-        let mut notes =
-            Vec::with_capacity(self.finished_notes.len().saturating_add(self.active_notes.len()));
+        let mut notes = Vec::with_capacity(
+            self.finished_notes
+                .len()
+                .saturating_add(self.active_notes.len()),
+        );
 
         for note in &self.finished_notes {
             if note.end_secs < cutoff
@@ -188,7 +191,12 @@ impl NoteEvent {
             confidence: note.note.confidence,
             alive: false,
             instrument_selection: note.note.instrument_selection,
-            audio_energy: note.note.audio_energy_envelope.last().copied().unwrap_or(0.0),
+            audio_energy: note
+                .note
+                .audio_energy_envelope
+                .last()
+                .copied()
+                .unwrap_or(0.0),
             audio_energy_hop_secs: note.note.audio_energy_hop_secs,
             audio_energy_envelope: note.note.audio_energy_envelope.clone(),
         }
@@ -225,11 +233,13 @@ impl NoteEvent {
     }
 
     fn current_audio_energy(&self, elapsed_secs: f32) -> f32 {
-        if self.alive || self.audio_energy_envelope.is_empty() || self.audio_energy_hop_secs <= 0.0 {
+        if self.alive || self.audio_energy_envelope.is_empty() || self.audio_energy_hop_secs <= 0.0
+        {
             return self.audio_energy.clamp(0.0, 1.0);
         }
 
-        let offset_secs = (elapsed_secs - self.start_secs).clamp(0.0, self.end_secs - self.start_secs);
+        let offset_secs =
+            (elapsed_secs - self.start_secs).clamp(0.0, self.end_secs - self.start_secs);
         let idx = (offset_secs / self.audio_energy_hop_secs).floor() as usize;
         self.audio_energy_envelope[idx.min(self.audio_energy_envelope.len() - 1)].clamp(0.0, 1.0)
     }

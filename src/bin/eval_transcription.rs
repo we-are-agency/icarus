@@ -25,7 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 json_out = Some(PathBuf::from(value));
             }
             "--help" | "-h" => {
-                eprintln!("Usage: cargo run --bin eval_transcription -- [--dataset DIR] [--json PATH]");
+                eprintln!(
+                    "Usage: cargo run --bin eval_transcription -- [--dataset DIR] [--json PATH]"
+                );
                 return Ok(());
             }
             other => return Err(format!("unknown argument: {other}").into()),
