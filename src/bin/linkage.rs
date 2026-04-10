@@ -1,18 +1,22 @@
 use nannou::prelude::*;
 use serde::Serialize;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
 const WINDOW_W: u32 = 1280;
 const WINDOW_H: u32 = 720;
 const MENU_BAR_H: f32 = 56.0;
 const PANE_MARGIN: f32 = 28.0;
 const PANE_GUTTER: f32 = 20.0;
+const PANE_TEXT_INSET: f32 = 14.0;
+const PANE_LINE_H: f32 = 12.0;
 const SPEC_RATIO: f32 = 0.38;
 const GRID_STEP: f32 = 36.0;
+const RENDER_VIEW_Y_OFFSET: f32 = 10.0;
+const P1_START_ANGLE: f32 = 0.78;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
@@ -20,18 +24,37 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 struct Config {
     headless: bool,
     capture_path: Option<PathBuf>,
+    fixture_index: usize,
 }
 
 struct Model {
     headless: bool,
     capture_path: Option<PathBuf>,
-    fixture: FixturePresentation,
-    headless_capture_queued: AtomicBool,
+    fixtures: Vec<FixturePresentation>,
+    selected_fixture: usize,
+    headless_capture_state: Cell<HeadlessCaptureState>,
+    headless_capture_result: Arc<AtomicU8>,
+    headless_proxy: Option<nannou::app::Proxy>,
+    spec_scroll_px: f32,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HeadlessCaptureState {
+    Pending,
+    Queued,
+    Flushed,
 }
 
 struct FixturePresentation {
+    label: &'static str,
+    status: FixtureStatus,
     json_lines: Vec<String>,
-    solved: SolvedAssembly,
+}
+
+enum FixtureStatus {
+    Solved(SolvedAssembly),
+    ValidationError(String),
+    SolverError(String),
 }
 
 struct SolvedAssembly {
@@ -139,6 +162,7 @@ impl Config {
     fn from_args() -> Self {
         let mut headless = false;
         let mut capture_path = None;
+        let mut fixture_index = 0;
         let mut args = std::env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -149,6 +173,14 @@ impl Config {
                         panic!("--capture requires a path argument");
                     };
                     capture_path = Some(PathBuf::from(path));
+                }
+                "--fixture" => {
+                    let Some(value) = args.next() else {
+                        panic!("--fixture requires an index");
+                    };
+                    fixture_index = value
+                        .parse::<usize>()
+                        .expect("--fixture must be a zero-based integer");
                 }
                 other => panic!("unknown argument: {other}"),
             }
@@ -161,6 +193,7 @@ impl Config {
         Self {
             headless,
             capture_path,
+            fixture_index,
         }
     }
 }
@@ -170,15 +203,17 @@ fn model(app: &App) -> Model {
         .get()
         .expect("linkage config should be available before model()")
         .clone();
-    let fixture = build_fixture_presentation().expect("failed to build P1 fixture");
+    let fixtures = build_fixture_presentations().expect("failed to build fixture bank");
 
     let mut window = app
         .new_window()
         .title("Linkage")
         .size(WINDOW_W, WINDOW_H)
         .view(view)
-        .key_pressed(key_pressed);
+        .key_pressed(key_pressed)
+        .mouse_wheel(mouse_wheel);
     if config.headless {
+        app.set_loop_mode(LoopMode::rate_fps(60.0));
         window = window.visible(false);
     }
     window.build().unwrap();
@@ -186,21 +221,80 @@ fn model(app: &App) -> Model {
     Model {
         headless: config.headless,
         capture_path: config.capture_path,
-        fixture,
-        headless_capture_queued: AtomicBool::new(false),
+        selected_fixture: config.fixture_index.min(fixtures.len().saturating_sub(1)),
+        fixtures,
+        headless_capture_state: Cell::new(HeadlessCaptureState::Pending),
+        headless_capture_result: Arc::new(AtomicU8::new(0)),
+        headless_proxy: if config.headless {
+            Some(app.create_proxy())
+        } else {
+            None
+        },
+        spec_scroll_px: 0.0,
     }
 }
 
-fn update(_app: &App, _model: &mut Model, _update: Update) {}
+fn update(app: &App, model: &mut Model, _update: Update) {
+    if model.headless && model.headless_capture_state.get() == HeadlessCaptureState::Queued {
+        match model.headless_capture_result.load(Ordering::SeqCst) {
+            1 => {
+                model
+                    .headless_capture_state
+                    .set(HeadlessCaptureState::Flushed);
+                app.quit();
+            }
+            2 => panic!("headless capture timed out before the PNG was fully written"),
+            _ => {}
+        }
+    }
+}
 
 fn key_pressed(app: &App, model: &mut Model, key: Key) {
-    if key == Key::S {
-        let path = model
-            .capture_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("target/linkage-windowed-capture.png"));
-        app.main_window().capture_frame(path);
+    match key {
+        Key::S => {
+            let path = model
+                .capture_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("target/linkage-windowed-capture.png"));
+            app.main_window().capture_frame(path);
+        }
+        Key::Key1 => select_fixture(model, 0),
+        Key::Key2 => select_fixture(model, 1),
+        Key::Key3 => select_fixture(model, 2),
+        Key::Tab => select_fixture(model, (model.selected_fixture + 1) % model.fixtures.len()),
+        Key::Up => scroll_spec(model, app.window_rect(), -PANE_LINE_H * 3.0),
+        Key::Down => scroll_spec(model, app.window_rect(), PANE_LINE_H * 3.0),
+        Key::PageUp => scroll_spec(
+            model,
+            app.window_rect(),
+            -visible_spec_body_height(app.window_rect()) * 0.9,
+        ),
+        Key::PageDown => scroll_spec(
+            model,
+            app.window_rect(),
+            visible_spec_body_height(app.window_rect()) * 0.9,
+        ),
+        Key::Home => model.spec_scroll_px = 0.0,
+        Key::End => {
+            model.spec_scroll_px = max_spec_scroll_px(current_fixture(model), app.window_rect())
+        }
+        _ => {}
     }
+}
+
+fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: TouchPhase) {
+    let win = app.window_rect();
+    let (spec_rect, _) = content_rects(win);
+    let mouse = app.mouse.position();
+    if !spec_rect.contains(mouse) {
+        return;
+    }
+
+    let scroll_delta = match delta {
+        MouseScrollDelta::LineDelta(_, y) => -y * PANE_LINE_H * 3.0,
+        MouseScrollDelta::PixelDelta(pos) => -(pos.y as f32),
+    };
+    scroll_spec(model, win, scroll_delta);
 }
 
 fn view(app: &App, model: &Model, frame: Frame) {
@@ -208,42 +302,79 @@ fn view(app: &App, model: &Model, frame: Frame) {
     let win = app.window_rect();
 
     draw.background().color(BLACK);
-    draw_scene(&draw, win, &model.fixture, model.headless);
+    draw_scene(&draw, win, model);
 
-    if model.headless && !model.headless_capture_queued.swap(true, Ordering::SeqCst) {
+    if model.headless && model.headless_capture_state.get() == HeadlessCaptureState::Pending {
         if let Some(path) = &model.capture_path {
             app.main_window().capture_frame(path);
             let capture_path = path.clone();
+            let capture_result = Arc::clone(&model.headless_capture_result);
+            let proxy = model
+                .headless_proxy
+                .as_ref()
+                .expect("headless mode should have an app proxy")
+                .clone();
             std::thread::spawn(move || {
-                for _ in 0..2400 {
-                    if let Ok(bytes) = std::fs::read(&capture_path) {
-                        if bytes.len() > 8 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                            std::thread::sleep(Duration::from_millis(100));
-                            std::process::exit(0);
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                eprintln!(
-                    "linkage headless capture timed out waiting for {}",
-                    capture_path.display()
-                );
-                std::process::exit(1);
+                let status = if wait_for_capture_flush(&capture_path) {
+                    1
+                } else {
+                    2
+                };
+                capture_result.store(status, Ordering::SeqCst);
+                let _ = proxy.wakeup();
             });
         }
+        model
+            .headless_capture_state
+            .set(HeadlessCaptureState::Queued);
     }
 
     draw.to_frame(app, &frame).unwrap();
 }
 
-fn build_fixture_presentation() -> Result<FixturePresentation, String> {
-    let assembly = slider_crank_fixture();
-    validate_fixture(&assembly)?;
-    let solved = solve_static_origin(&assembly)?;
+fn select_fixture(model: &mut Model, index: usize) {
+    if index < model.fixtures.len() {
+        model.selected_fixture = index;
+        model.spec_scroll_px = 0.0;
+    }
+}
+
+fn current_fixture(model: &Model) -> &FixturePresentation {
+    &model.fixtures[model.selected_fixture]
+}
+
+fn build_fixture_presentations() -> Result<Vec<FixturePresentation>, String> {
+    let fixtures = vec![
+        ("1 VALID", slider_crank_fixture()),
+        ("2 BAD REF", invalid_reference_fixture()),
+        ("3 UNSOLVED", unsolved_slider_crank_fixture()),
+    ];
+
+    fixtures
+        .into_iter()
+        .map(|(label, assembly)| build_fixture_presentation(label, assembly))
+        .collect()
+}
+
+fn build_fixture_presentation(
+    label: &'static str,
+    assembly: AssemblySpec,
+) -> Result<FixturePresentation, String> {
     let json = serde_json::to_string_pretty(&assembly)
         .map_err(|err| format!("failed to serialize fixture JSON: {err}"))?;
+    let status = match validate_fixture(&assembly) {
+        Ok(()) => match solve_slider_crank_origin(&assembly) {
+            Ok(solved) => FixtureStatus::Solved(solved),
+            Err(err) => FixtureStatus::SolverError(err),
+        },
+        Err(err) => FixtureStatus::ValidationError(err),
+    };
     let json_lines = json.lines().map(|line| line.to_string()).collect();
-    Ok(FixturePresentation { json_lines, solved })
+    Ok(FixturePresentation {
+        label,
+        status,
+        json_lines,
+    })
 }
 
 fn slider_crank_fixture() -> AssemblySpec {
@@ -292,7 +423,7 @@ fn slider_crank_fixture() -> AssemblySpec {
                 pivot_joint: "j_pivot".to_string(),
                 tip_joint: "j_tip".to_string(),
                 link: "l_crank".to_string(),
-                range: [0.78, 6.283185],
+                range: [P1_START_ANGLE, TAU],
             },
             sweep: SweepSpec {
                 samples: 180,
@@ -312,6 +443,26 @@ fn slider_crank_fixture() -> AssemblySpec {
             notes: vec!["P1 closed-form hard-coded fixture".to_string()],
         },
     }
+}
+
+fn invalid_reference_fixture() -> AssemblySpec {
+    let mut assembly = slider_crank_fixture();
+    if let Some(PartSpec::Link { b, .. }) = assembly.parts.get_mut("l_coupler") {
+        *b = "j_missing".to_string();
+    }
+    assembly.meta.name = "p1-invalid-reference".to_string();
+    assembly.meta.notes = vec!["Intentional validator failure".to_string()];
+    assembly
+}
+
+fn unsolved_slider_crank_fixture() -> AssemblySpec {
+    let mut assembly = slider_crank_fixture();
+    if let Some(PartSpec::Link { length, .. }) = assembly.parts.get_mut("l_coupler") {
+        *length = 30.0;
+    }
+    assembly.meta.name = "p1-unsolved-slider-crank".to_string();
+    assembly.meta.notes = vec!["Intentional solver failure".to_string()];
+    assembly
 }
 
 fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
@@ -339,6 +490,11 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
                 }
                 if (axis_dir[0] * axis_dir[0] + axis_dir[1] * axis_dir[1]) < 0.99 {
                     return Err(format!("part {part_id}: slider axis is not normalized"));
+                }
+                if axis_dir[0].abs() < 0.999 || axis_dir[1].abs() > 0.001 {
+                    return Err(format!(
+                        "part {part_id}: P1 fixture renderer requires a horizontal slider axis"
+                    ));
                 }
                 if range[0] >= range[1] {
                     return Err(format!("part {part_id}: invalid slider range"));
@@ -373,7 +529,7 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
     Ok(())
 }
 
-fn solve_static_origin(assembly: &AssemblySpec) -> Result<SolvedAssembly, String> {
+fn solve_slider_crank_origin(assembly: &AssemblySpec) -> Result<SolvedAssembly, String> {
     let pivot = match assembly.joints.get("j_pivot") {
         Some(JointSpec::Fixed { position }) => pt2(position[0], position[1]),
         _ => return Err("fixture missing fixed pivot".to_string()),
@@ -468,26 +624,27 @@ fn solve_static_origin(assembly: &AssemblySpec) -> Result<SolvedAssembly, String
     })
 }
 
-fn draw_scene(draw: &Draw, win: Rect, fixture: &FixturePresentation, headless: bool) {
-    draw_menu_layer(draw, win, headless);
-
-    let content_top = win.top() - MENU_BAR_H - PANE_MARGIN;
-    let content_bottom = win.bottom() + PANE_MARGIN;
-    let content_h = content_top - content_bottom;
-    let content_w = win.w() - PANE_MARGIN * 2.0;
-    let spec_w = content_w * SPEC_RATIO;
-    let render_w = content_w - spec_w - PANE_GUTTER;
-    let spec_x = win.left() + PANE_MARGIN + spec_w * 0.5;
-    let render_x = spec_x + spec_w * 0.5 + PANE_GUTTER + render_w * 0.5;
-    let content_y = (content_top + content_bottom) * 0.5;
-    let spec_rect = Rect::from_xy_wh(pt2(spec_x, content_y), vec2(spec_w, content_h));
-    let render_rect = Rect::from_xy_wh(pt2(render_x, content_y), vec2(render_w, content_h));
-
-    draw_spec_pane(draw, spec_rect, fixture);
-    draw_render_pane(draw, render_rect, &fixture.solved);
+fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
+    let fixture = current_fixture(model);
+    draw_menu_layer(
+        draw,
+        win,
+        model.headless,
+        &model.fixtures,
+        model.selected_fixture,
+    );
+    let (spec_rect, render_rect) = content_rects(win);
+    draw_spec_pane(draw, spec_rect, fixture, model.spec_scroll_px);
+    draw_render_pane(draw, render_rect, fixture);
 }
 
-fn draw_menu_layer(draw: &Draw, win: Rect, headless: bool) {
+fn draw_menu_layer(
+    draw: &Draw,
+    win: Rect,
+    headless: bool,
+    fixtures: &[FixturePresentation],
+    selected_fixture: usize,
+) {
     let bar_y = win.top() - MENU_BAR_H * 0.5;
     draw.rect()
         .x_y(0.0, bar_y)
@@ -504,87 +661,158 @@ fn draw_menu_layer(draw: &Draw, win: Rect, headless: bool) {
         .x_y(win.right() - 78.0, win.top() - 24.0)
         .font_size(9)
         .color(rgba(1.0, 1.0, 1.0, 0.68));
-}
 
-fn draw_spec_pane(draw: &Draw, rect: Rect, fixture: &FixturePresentation) {
-    draw.rect()
-        .xy(rect.xy())
-        .wh(rect.wh())
-        .color(rgba(0.035, 0.04, 0.055, 1.0));
-
-    draw.text("ASSEMBLY JSON")
-        .x_y(rect.left() + 70.0, rect.top() - 18.0)
-        .font_size(9)
-        .color(rgba(1.0, 1.0, 1.0, 0.82))
-        .left_justify();
-
-    draw.line()
-        .start(pt2(rect.right(), rect.bottom()))
-        .end(pt2(rect.right(), rect.top()))
-        .color(rgba(1.0, 1.0, 1.0, 0.18))
-        .weight(1.0);
-
-    let mut y = rect.top() - 42.0;
-    for line in &fixture.json_lines {
-        if y < rect.bottom() + 14.0 {
-            break;
-        }
-        draw.text(line)
-            .x_y(rect.left() + 12.0, y)
+    let start_x = win.left() + 230.0;
+    let step = 86.0;
+    let indicator_y = win.top() - 36.0;
+    for (index, fixture) in fixtures.iter().enumerate() {
+        let x = start_x + index as f32 * step;
+        draw.text(fixture.label)
+            .x_y(x, win.top() - 24.0)
             .font_size(8)
-            .color(rgba(1.0, 1.0, 1.0, 0.46))
-            .left_justify();
-        y -= 12.0;
+            .color(if index == selected_fixture {
+                rgba(1.0, 1.0, 1.0, 0.82)
+            } else {
+                rgba(1.0, 1.0, 1.0, 0.42)
+            });
+
+        if index == selected_fixture {
+            draw.line()
+                .start(pt2(x - 24.0, indicator_y))
+                .end(pt2(x + 24.0, indicator_y))
+                .color(rgba(1.0, 1.0, 1.0, 0.92))
+                .weight(2.0);
+        }
     }
 }
 
-fn draw_render_pane(draw: &Draw, rect: Rect, solved: &SolvedAssembly) {
-    draw.rect()
-        .xy(rect.xy())
-        .wh(rect.wh())
-        .color(rgba(0.018, 0.02, 0.03, 1.0));
+fn draw_spec_pane(draw: &Draw, rect: Rect, fixture: &FixturePresentation, scroll_px: f32) {
+    let text_w = rect.w() - PANE_TEXT_INSET * 2.0;
+    let text_x = rect.left() + PANE_TEXT_INSET + text_w * 0.5;
+    let body_top = rect.top() - 42.0;
+    let body_bottom = rect.bottom() + 14.0;
 
-    draw.text("STATIC SOLVED ORIGIN")
-        .x_y(rect.left() + 88.0, rect.top() - 18.0)
+    draw.text("ASSEMBLY JSON")
+        .x_y(text_x, rect.top() - 18.0)
+        .w_h(text_w, PANE_LINE_H)
         .font_size(9)
         .color(rgba(1.0, 1.0, 1.0, 0.82))
         .left_justify();
 
-    draw.text("closed-form slider-crank fixture")
-        .x_y(rect.left() + 102.0, rect.top() - 34.0)
+    let start_line = (scroll_px / PANE_LINE_H).floor() as usize;
+    let intra_line_offset = scroll_px % PANE_LINE_H;
+    let mut y = body_top + intra_line_offset;
+
+    for line in fixture.json_lines.iter().skip(start_line) {
+        if y < body_bottom {
+            break;
+        }
+        if y > body_top {
+            y -= PANE_LINE_H;
+            continue;
+        }
+        draw.text(line)
+            .x_y(text_x, y)
+            .w_h(text_w, PANE_LINE_H)
+            .font_size(8)
+            .color(rgba(1.0, 1.0, 1.0, 0.60))
+            .left_justify();
+        y -= PANE_LINE_H;
+    }
+
+    let max_scroll = max_spec_scroll_px_for_rect(fixture, rect);
+    if max_scroll > 0.0 {
+        let track_h = (body_top - body_bottom).max(1.0);
+        let thumb_h = (track_h * (track_h / (track_h + max_scroll))).clamp(28.0, track_h);
+        let thumb_travel = (track_h - thumb_h).max(0.0);
+        let thumb_t = if max_scroll > 0.0 {
+            scroll_px / max_scroll
+        } else {
+            0.0
+        };
+        let thumb_center_y = body_top - thumb_h * 0.5 - thumb_travel * thumb_t;
+        let track_x = rect.right() - 14.0;
+
+        draw.rect()
+            .x_y(track_x, (body_top + body_bottom) * 0.5)
+            .w_h(2.0, track_h)
+            .color(rgba(1.0, 1.0, 1.0, 0.10));
+        draw.rect()
+            .x_y(track_x, thumb_center_y)
+            .w_h(3.0, thumb_h)
+            .color(rgba(1.0, 1.0, 1.0, 0.36));
+    }
+}
+
+fn draw_render_pane(draw: &Draw, rect: Rect, fixture: &FixturePresentation) {
+    let text_w = rect.w() - PANE_TEXT_INSET * 2.0;
+    let text_x = rect.left() + PANE_TEXT_INSET + text_w * 0.5;
+
+    let title = match fixture.status {
+        FixtureStatus::Solved(_) => "STATIC SOLVED ORIGIN",
+        FixtureStatus::ValidationError(_) => "VALIDATION FAILURE",
+        FixtureStatus::SolverError(_) => "SOLVER FAILURE",
+    };
+    draw.text(title)
+        .x_y(text_x, rect.top() - 18.0)
+        .w_h(text_w, PANE_LINE_H)
+        .font_size(9)
+        .color(rgba(1.0, 1.0, 1.0, 0.82))
+        .left_justify();
+
+    let subtitle = match fixture.status {
+        FixtureStatus::Solved(_) => "closed-form slider-crank fixture",
+        FixtureStatus::ValidationError(_) => "validator rejected the selected fixture",
+        FixtureStatus::SolverError(_) => "solver could not produce a static origin pose",
+    };
+    draw.text(subtitle)
+        .x_y(text_x, rect.top() - 34.0)
+        .w_h(text_w, PANE_LINE_H)
         .font_size(8)
         .color(rgba(1.0, 1.0, 1.0, 0.40))
         .left_justify();
 
-    let local_draw = draw.x_y(rect.x(), rect.y() - 10.0);
+    let local_draw = draw.x_y(rect.x(), rect.y() - RENDER_VIEW_Y_OFFSET);
     let local_rect = Rect::from_w_h(rect.w() - 28.0, rect.h() - 72.0);
-    draw_grid_local(&local_draw, local_rect);
-    draw_solution_local(&local_draw, local_rect, solved);
+    match &fixture.status {
+        FixtureStatus::Solved(solved) => {
+            draw_grid_local(&local_draw, local_rect);
+            draw_solution_local(&local_draw, local_rect, solved);
+        }
+        FixtureStatus::ValidationError(message) => {
+            draw_error_state(&local_draw, local_rect, "VALIDATOR", message);
+        }
+        FixtureStatus::SolverError(message) => {
+            draw_error_state(&local_draw, local_rect, "SOLVER", message);
+        }
+    }
 }
 
 fn draw_grid_local(draw: &Draw, rect: Rect) {
-    let mut x = (rect.left() / GRID_STEP).floor() * GRID_STEP;
-    while x <= rect.right() {
-        let alpha = if x.abs() < 0.5 { 0.20 } else { 0.06 };
-        let weight = if x.abs() < 0.5 { 1.25 } else { 1.0 };
+    let cols = (rect.w() / GRID_STEP).ceil() as i32;
+    for col in 0..=cols {
+        let x = rect.left() + col as f32 * GRID_STEP;
+        let is_major = col % 4 == 0;
+        let alpha = if is_major { 0.20 } else { 0.06 };
+        let weight = if is_major { 1.25 } else { 1.0 };
         draw.line()
             .start(pt2(x, rect.bottom()))
             .end(pt2(x, rect.top()))
             .color(rgba(1.0, 1.0, 1.0, alpha))
             .weight(weight);
-        x += GRID_STEP;
     }
 
-    let mut y = (rect.bottom() / GRID_STEP).floor() * GRID_STEP;
-    while y <= rect.top() {
-        let alpha = if y.abs() < 0.5 { 0.20 } else { 0.06 };
-        let weight = if y.abs() < 0.5 { 1.25 } else { 1.0 };
+    let rows = (rect.h() / GRID_STEP).ceil() as i32;
+    for row in 0..=rows {
+        let y = rect.bottom() + row as f32 * GRID_STEP;
+        let is_major = row % 4 == 0;
+        let alpha = if is_major { 0.20 } else { 0.06 };
+        let weight = if is_major { 1.25 } else { 1.0 };
         draw.line()
             .start(pt2(rect.left(), y))
             .end(pt2(rect.right(), y))
             .color(rgba(1.0, 1.0, 1.0, alpha))
             .weight(weight);
-        y += GRID_STEP;
     }
 }
 
@@ -637,6 +865,26 @@ fn draw_solution_local(draw: &Draw, rect: Rect, solved: &SolvedAssembly) {
     }
 }
 
+fn draw_error_state(draw: &Draw, rect: Rect, source: &str, message: &str) {
+    draw_grid_local(draw, rect);
+    let text_w = rect.w() - 120.0;
+    let text_x = rect.left() + 28.0 + text_w * 0.5;
+
+    draw.text(source)
+        .x_y(text_x, rect.top() - 36.0)
+        .w_h(text_w, 16.0)
+        .font_size(9)
+        .color(rgba(1.0, 0.48, 0.48, 0.88))
+        .left_justify();
+
+    draw.text(message)
+        .x_y(text_x, rect.top() - 62.0)
+        .w_h(text_w, 64.0)
+        .font_size(8)
+        .color(rgba(1.0, 1.0, 1.0, 0.70))
+        .left_justify();
+}
+
 fn draw_slider_local<F>(draw: &Draw, solved: &SolvedAssembly, map: F)
 where
     F: Fn(Point2) -> Point2,
@@ -676,6 +924,74 @@ where
         .x_y(slider_joint.x, slider_joint.y)
         .w_h(16.0, 10.0)
         .color(rgba(0.34, 0.78, 0.98, 0.22));
+}
+
+fn wait_for_capture_flush(path: &PathBuf) -> bool {
+    let mut previous_len = 0;
+    let mut stable_reads = 0;
+
+    for _ in 0..2400 {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let len = metadata.len();
+            if len > 8 {
+                if let Ok(bytes) = std::fs::read(path) {
+                    let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+                    if is_png && len == previous_len {
+                        stable_reads += 1;
+                        if stable_reads >= 3 {
+                            return true;
+                        }
+                    } else {
+                        stable_reads = 0;
+                    }
+                }
+            }
+            previous_len = len;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    false
+}
+
+fn scroll_spec(model: &mut Model, win: Rect, delta_px: f32) {
+    let next = model.spec_scroll_px + delta_px;
+    model.spec_scroll_px = next.clamp(0.0, max_spec_scroll_px(current_fixture(model), win));
+}
+
+fn visible_spec_body_height(win: Rect) -> f32 {
+    let (spec_rect, _) = content_rects(win);
+    visible_spec_body_height_for_rect(spec_rect)
+}
+
+fn max_spec_scroll_px(fixture: &FixturePresentation, win: Rect) -> f32 {
+    let (spec_rect, _) = content_rects(win);
+    max_spec_scroll_px_for_rect(fixture, spec_rect)
+}
+
+fn visible_spec_body_height_for_rect(spec_rect: Rect) -> f32 {
+    spec_rect.h() - 56.0
+}
+
+fn max_spec_scroll_px_for_rect(fixture: &FixturePresentation, spec_rect: Rect) -> f32 {
+    let available = visible_spec_body_height_for_rect(spec_rect).max(0.0);
+    let content = fixture.json_lines.len() as f32 * PANE_LINE_H;
+    (content - available).max(0.0)
+}
+
+fn content_rects(win: Rect) -> (Rect, Rect) {
+    let content_top = win.top() - MENU_BAR_H - PANE_MARGIN;
+    let content_bottom = win.bottom() + PANE_MARGIN;
+    let content_h = content_top - content_bottom;
+    let content_w = win.w() - PANE_MARGIN * 2.0;
+    let spec_w = content_w * SPEC_RATIO;
+    let render_w = content_w - spec_w - PANE_GUTTER;
+    let spec_x = win.left() + PANE_MARGIN + spec_w * 0.5;
+    let render_x = spec_x + spec_w * 0.5 + PANE_GUTTER + render_w * 0.5;
+    let content_y = (content_top + content_bottom) * 0.5;
+    let spec_rect = Rect::from_xy_wh(pt2(spec_x, content_y), vec2(spec_w, content_h));
+    let render_rect = Rect::from_xy_wh(pt2(render_x, content_y), vec2(render_w, content_h));
+    (spec_rect, render_rect)
 }
 
 fn solved_bounds(solved: &SolvedAssembly) -> Rect {
