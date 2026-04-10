@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -18,19 +19,23 @@ const PANE_LINE_H: f32 = 12.0;
 const SPEC_RATIO: f32 = 0.38;
 const GRID_STEP: f32 = 36.0;
 const RENDER_VIEW_Y_OFFSET: f32 = 10.0;
-const STARTUP_MODEL: &str = "gpt-5.3-codex";
+const STARTUP_MODEL: &str = "gpt-5.4";
 const MAX_TRACE_CYCLE_ENTITIES: usize = 256;
 const MAX_LIVE_TRACE_POINTS: usize = 4096;
-const MAX_LLM_HISTORY_MESSAGES: usize = 24;
+const MAX_LLM_HISTORY_MESSAGES: usize = 150;
 const GRAVITY_ACCEL_Y: f32 = 0.18;
 const RELAXATION_ITERATIONS: usize = 96;
 const RELAXATION_TOLERANCE: f32 = 0.001;
 const RELAXATION_DAMPING: f32 = 0.98;
 const RELAXATION_DIVERGENCE_LIMIT: f32 = 10_000.0;
 const SCREEN_LOG_PATH: &str = "linkage.log";
+const POI_TRACE_DEBUG_PATH: &str = "poi.json";
+const POI_TRACE_DEBUG_SAMPLES: usize = 20;
+const MAX_TOOL_CORRECTION_ATTEMPTS: usize = 40;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 static SCREEN_LOG_LAST_SNAPSHOT: OnceLock<Mutex<String>> = OnceLock::new();
+static POI_TRACE_LAST_SNAPSHOT: OnceLock<Mutex<String>> = OnceLock::new();
 static NEXT_ARTIFACT_TURN: AtomicU32 = AtomicU32::new(1);
 #[derive(Clone, Debug)]
 struct Config {
@@ -59,6 +64,7 @@ struct Model {
     llm_history: Vec<LlmHistoryMessage>,
     chat_input: String,
     chat_input_focused: bool,
+    latest_full_cycle_traces: BTreeMap<String, Vec<TraceSample>>,
     trace_cycle_entities: Vec<TraceCycleEntity>,
     emitted_trace_cycles: u32,
 }
@@ -114,6 +120,7 @@ struct LlmHistoryMessage {
 #[derive(Clone, Copy)]
 enum LlmHistoryRole {
     User,
+    Tool,
     Assistant,
 }
 
@@ -383,25 +390,6 @@ struct AssemblyMeta {
     name: String,
     iteration: u32,
     notes: Vec<String>,
-    #[serde(
-        default = "default_simulation_mode",
-        skip_serializing_if = "simulation_mode_is_default"
-    )]
-    simulation_mode: SimulationModeSpec,
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
-enum SimulationModeSpec {
-    Strict,
-    Expressive,
-}
-
-fn default_simulation_mode() -> SimulationModeSpec {
-    SimulationModeSpec::Expressive
-}
-
-fn simulation_mode_is_default(mode: &SimulationModeSpec) -> bool {
-    *mode == default_simulation_mode()
 }
 
 #[derive(Deserialize)]
@@ -547,6 +535,7 @@ fn model(app: &App) -> Model {
         llm_history,
         chat_input: String::new(),
         chat_input_focused: !config.headless,
+        latest_full_cycle_traces: BTreeMap::new(),
         trace_cycle_entities: Vec::new(),
         emitted_trace_cycles: 0,
     }
@@ -578,6 +567,7 @@ fn update(app: &App, model: &mut Model, update: Update) {
                 model.playback_progress = 0.0;
             }
             model.active_artifact_turn = Some(artifact.turn);
+            model.latest_full_cycle_traces.clear();
             model.trace_cycle_entities.clear();
             model.emitted_trace_cycles = model.playback_progress.floor().max(0.0) as u32;
             model.live_trace_cycle = model.emitted_trace_cycles;
@@ -603,6 +593,7 @@ fn update(app: &App, model: &mut Model, update: Update) {
             let completed_cycles = model.playback_progress.floor().max(0.0) as u32;
             if rolling_paper_config(&artifact).is_some() {
                 while model.emitted_trace_cycles < completed_cycles {
+                    model.latest_full_cycle_traces = state.cycle_samples.clone();
                     spawn_trace_cycle_entities_from_samples(
                         &mut model.trace_cycle_entities,
                         &state.cycle_samples,
@@ -651,6 +642,7 @@ fn update(app: &App, model: &mut Model, update: Update) {
         model.live_trace_cycle = 0;
         model.live_trace_u = 0.0;
         model.live_simulation = None;
+        model.latest_full_cycle_traces.clear();
         model.trace_cycle_entities.clear();
         model.emitted_trace_cycles = 0;
     }
@@ -818,6 +810,8 @@ fn submit_chat_input(model: &mut Model) {
     }
     let prompt = prompt.to_string();
     let base_assembly = startup_fixture_assembly(model).unwrap_or_else(empty_startup_assembly);
+    let poi_trace_context_json =
+        poi_trace_context_json(model).unwrap_or_else(|_| "{\"source\":\"unavailable\"}".to_string());
     let mut history = model.llm_history.clone();
     history.push(LlmHistoryMessage {
         role: LlmHistoryRole::User,
@@ -835,7 +829,7 @@ fn submit_chat_input(model: &mut Model) {
     model.spec_scroll_px = f32::INFINITY;
     model.chat_input.clear();
     model.llm_history = history.clone();
-    model.llm_turn_rx = Some(spawn_chat_turn(base_assembly, history));
+    model.llm_turn_rx = Some(spawn_chat_turn(base_assembly, history, poi_trace_context_json));
     select_fixture(model, 0);
 }
 
@@ -861,6 +855,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
     draw.background().color(BLACK);
     draw_scene(&draw, win, model);
     write_screen_log_snapshot(model, win);
+    write_poi_trace_debug_json(model);
 
     if model.headless
         && model.headless_capture_state.get() == HeadlessCaptureState::Pending
@@ -1066,11 +1061,11 @@ fn build_fixture_presentations() -> Result<
     let (startup_fixture, llm_turn_rx) = startup_fixture_slot();
     let fixtures = vec![
         startup_fixture,
-        build_fixture_presentation("2 STRICT", slider_crank_fixture())?,
+        build_fixture_presentation("2 SAMPLE", slider_crank_fixture())?,
         build_fixture_presentation("3 BAD REF", invalid_reference_fixture())?,
-        build_fixture_presentation("4 UNSOLVED", unsolved_slider_crank_fixture())?,
-        build_fixture_presentation("5 CHAINY", expressive_chain_fixture())?,
-        build_fixture_presentation("6 BRANCHY", expressive_branchy_fixture())?,
+        build_fixture_presentation("4 CHAINY", expressive_chain_fixture())?,
+        build_fixture_presentation("5 BRANCHY", expressive_branchy_fixture())?,
+        build_fixture_presentation("6 BIRD", bird_flapper_fixture())?,
     ];
 
     Ok((fixtures, llm_turn_rx))
@@ -1157,10 +1152,11 @@ fn trim_llm_history(history: &mut Vec<LlmHistoryMessage>) {
 
     let excess = history.len() - MAX_LLM_HISTORY_MESSAGES;
     history.drain(0..excess);
-    if matches!(
-        history.first().map(|message| message.role),
-        Some(LlmHistoryRole::Assistant)
-    ) && history.len() > 1
+    while history.len() > 1
+        && !matches!(
+            history.first().map(|message| message.role),
+            Some(LlmHistoryRole::User)
+        )
     {
         history.remove(0);
     }
@@ -1191,16 +1187,20 @@ fn spawn_llm_turn(
     ];
     let history_for_thread = history.clone();
     std::thread::spawn(move || {
-        let result = run_llm_turn(base_assembly, history_for_thread, replace_chat);
+        let result = run_llm_turn(base_assembly, history_for_thread, replace_chat, None);
         let _ = tx.send(result);
     });
     (rx, pending_entries, history)
 }
 
-fn spawn_chat_turn(base_assembly: AssemblySpec, history: Vec<LlmHistoryMessage>) -> Receiver<LlmTurnResult> {
+fn spawn_chat_turn(
+    base_assembly: AssemblySpec,
+    history: Vec<LlmHistoryMessage>,
+    poi_trace_context_json: String,
+) -> Receiver<LlmTurnResult> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = run_llm_turn(base_assembly, history, false);
+        let result = run_llm_turn(base_assembly, history, false, Some(poi_trace_context_json));
         let _ = tx.send(result);
     });
     rx
@@ -1210,6 +1210,7 @@ fn run_llm_turn(
     base_assembly: AssemblySpec,
     history: Vec<LlmHistoryMessage>,
     replace_chat: bool,
+    poi_trace_context_json: Option<String>,
 ) -> LlmTurnResult {
     let Some(latest_prompt) = history.last().map(|message| message.text.clone()) else {
         return LlmTurnResult {
@@ -1231,7 +1232,12 @@ fn run_llm_turn(
         }
     };
 
-    match generate_llm_turn(&api_key, &base_assembly, &history) {
+    match generate_llm_turn(
+        &api_key,
+        &base_assembly,
+        &history,
+        poi_trace_context_json.as_deref(),
+    ) {
         Ok((assembly, args, exchanges)) => {
             let fixture = match build_fixture_presentation("1 STARTUP", assembly) {
                 Ok(fixture) => Some(fixture),
@@ -1245,7 +1251,11 @@ fn run_llm_turn(
                 }
             };
             let mut entries = Vec::new();
-            for exchange in exchanges {
+            let mut history_messages = exchanges
+                .iter()
+                .map(tool_exchange_history_message)
+                .collect::<Vec<_>>();
+            for exchange in &exchanges {
                 entries.push(ChatEntry {
                     role: ChatRole::Tool,
                     text: format!("propose_mutations arguments\n{}", exchange.arguments),
@@ -1263,7 +1273,6 @@ fn run_llm_turn(
                     args.reasoning.trim().to_string()
                 },
             });
-            let mut history_messages = Vec::new();
             if !args.reasoning.trim().is_empty() {
                 history_messages.push(LlmHistoryMessage {
                     role: LlmHistoryRole::Assistant,
@@ -1284,7 +1293,12 @@ fn run_llm_turn(
         }
         Err(err) => {
             let mut entries = Vec::new();
-            for exchange in err.exchanges {
+            let mut history_messages = err
+                .exchanges
+                .iter()
+                .map(tool_exchange_history_message)
+                .collect::<Vec<_>>();
+            for exchange in &err.exchanges {
                 entries.push(ChatEntry {
                     role: ChatRole::Tool,
                     text: format!("propose_mutations arguments\n{}", exchange.arguments),
@@ -1294,14 +1308,28 @@ fn run_llm_turn(
                     text: format!("propose_mutations response\n{}", exchange.response),
                 });
             }
-            entries.push(error_chat_entry(err.message));
+            entries.push(error_chat_entry(err.message.clone()));
+            history_messages.push(LlmHistoryMessage {
+                role: LlmHistoryRole::Assistant,
+                text: err.message,
+            });
             LlmTurnResult {
                 fixture: None,
                 entries,
-                history_messages: Vec::new(),
+                history_messages,
                 replace_chat,
             }
         }
+    }
+}
+
+fn tool_exchange_history_message(exchange: &ToolExchange) -> LlmHistoryMessage {
+    LlmHistoryMessage {
+        role: LlmHistoryRole::Tool,
+        text: format!(
+            "propose_mutations arguments\n{}\n\npropose_mutations response\n{}",
+            exchange.arguments, exchange.response
+        ),
     }
 }
 
@@ -1380,7 +1408,57 @@ fn slider_crank_fixture() -> AssemblySpec {
             name: "p1-slider-crank".to_string(),
             iteration: 1,
             notes: vec!["P1 deterministic relaxation fixture".to_string()],
-            simulation_mode: SimulationModeSpec::Strict,
+        },
+    }
+}
+
+fn short_arm_fixture() -> AssemblySpec {
+    let mut joints = BTreeMap::new();
+    joints.insert(
+        "j_pivot".to_string(),
+        JointSpec::Fixed {
+            position: [-80.0, 60.0],
+        },
+    );
+    joints.insert("j_tip".to_string(), JointSpec::Free);
+
+    let mut parts = BTreeMap::new();
+    parts.insert(
+        "l_arm".to_string(),
+        PartSpec::Link {
+            a: "j_pivot".to_string(),
+            b: "j_tip".to_string(),
+            length: 36.0,
+        },
+    );
+
+    let mut drives = BTreeMap::new();
+    drives.insert(
+        "d_arm".to_string(),
+        DriveSpec {
+            kind: DriveKindSpec::Angular {
+                pivot_joint: "j_pivot".to_string(),
+                tip_joint: "j_tip".to_string(),
+                link: "l_arm".to_string(),
+                range: None,
+            },
+            sweep: SweepSpec {
+                samples: 180,
+                direction: SweepDirectionSpec::Clockwise,
+            },
+        },
+    );
+
+    AssemblySpec {
+        joints,
+        parts,
+        drives,
+        points_of_interest: Vec::new(),
+        visualization: None,
+        meta: AssemblyMeta {
+            name: "startup-short-arm".to_string(),
+            iteration: 1,
+            notes: vec!["Minimal startup arm fixture".to_string()],
         },
     }
 }
@@ -1392,17 +1470,6 @@ fn invalid_reference_fixture() -> AssemblySpec {
     }
     assembly.meta.name = "p1-invalid-reference".to_string();
     assembly.meta.notes = vec!["Intentional validator failure".to_string()];
-    assembly
-}
-
-fn unsolved_slider_crank_fixture() -> AssemblySpec {
-    let mut assembly = slider_crank_fixture();
-    if let Some(PartSpec::Slider { range, .. }) = assembly.parts.get_mut("s_track") {
-        *range = [500.0, 600.0];
-    }
-    assembly.meta.name = "p1-unsolved-slider-crank".to_string();
-    assembly.meta.notes = vec!["Intentional relaxation range failure".to_string()];
-    assembly.meta.simulation_mode = SimulationModeSpec::Strict;
     assembly
 }
 
@@ -1464,7 +1531,6 @@ fn expressive_chain_fixture() -> AssemblySpec {
         "Three-link expressive chain between the crank tip and the slider".to_string(),
         "Ambiguous folds are allowed".to_string(),
     ];
-    assembly.meta.simulation_mode = SimulationModeSpec::Expressive;
     assembly
 }
 
@@ -1481,16 +1547,132 @@ fn expressive_branchy_fixture() -> AssemblySpec {
     assembly.meta.name = "p3-branchy-impossible-brace".to_string();
     assembly.meta.notes = vec![
         "Impossible brace forces branchy, under-settled motion".to_string(),
-        "Expressive mode keeps the drawable artifact instead of failing hard".to_string(),
+        "The renderer keeps the drawable artifact instead of failing hard".to_string(),
     ];
-    assembly.meta.simulation_mode = SimulationModeSpec::Expressive;
     assembly
+}
+
+fn bird_flapper_fixture() -> AssemblySpec {
+    let mut joints = BTreeMap::new();
+    joints.insert(
+        "j_pivot".to_string(),
+        JointSpec::Fixed {
+            position: [-80.0, 60.0],
+        },
+    );
+    joints.insert(
+        "j_left_shoulder".to_string(),
+        JointSpec::Fixed {
+            position: [-122.0, 94.0],
+        },
+    );
+    joints.insert(
+        "j_right_shoulder".to_string(),
+        JointSpec::Fixed {
+            position: [-122.0, 26.0],
+        },
+    );
+    joints.insert("j_tip".to_string(), JointSpec::Free);
+    joints.insert("j_left_wing".to_string(), JointSpec::Free);
+    joints.insert("j_right_wing".to_string(), JointSpec::Free);
+
+    let mut parts = BTreeMap::new();
+    parts.insert(
+        "l_body".to_string(),
+        PartSpec::Link {
+            a: "j_pivot".to_string(),
+            b: "j_tip".to_string(),
+            length: 36.0,
+        },
+    );
+    parts.insert(
+        "l_left_root".to_string(),
+        PartSpec::Link {
+            a: "j_left_shoulder".to_string(),
+            b: "j_left_wing".to_string(),
+            length: 68.0,
+        },
+    );
+    parts.insert(
+        "l_left_span".to_string(),
+        PartSpec::Link {
+            a: "j_tip".to_string(),
+            b: "j_left_wing".to_string(),
+            length: 58.0,
+        },
+    );
+    parts.insert(
+        "l_right_root".to_string(),
+        PartSpec::Link {
+            a: "j_right_shoulder".to_string(),
+            b: "j_right_wing".to_string(),
+            length: 68.0,
+        },
+    );
+    parts.insert(
+        "l_right_span".to_string(),
+        PartSpec::Link {
+            a: "j_tip".to_string(),
+            b: "j_right_wing".to_string(),
+            length: 58.0,
+        },
+    );
+
+    let mut drives = BTreeMap::new();
+    drives.insert(
+        "d_body".to_string(),
+        DriveSpec {
+            kind: DriveKindSpec::Angular {
+                pivot_joint: "j_pivot".to_string(),
+                tip_joint: "j_tip".to_string(),
+                link: "l_body".to_string(),
+                range: Some([-0.55, 0.55]),
+            },
+            sweep: SweepSpec {
+                samples: 180,
+                direction: SweepDirectionSpec::PingPong,
+            },
+        },
+    );
+
+    AssemblySpec {
+        joints,
+        parts,
+        drives,
+        points_of_interest: vec![
+            PointOfInterestSpec {
+                id: "poi_left_wing_tip".to_string(),
+                host: "l_left_span".to_string(),
+                t: 1.0,
+                perp: 0.0,
+            },
+            PointOfInterestSpec {
+                id: "poi_right_wing_tip".to_string(),
+                host: "l_right_span".to_string(),
+                t: 1.0,
+                perp: 0.0,
+            },
+        ],
+        visualization: None,
+        meta: AssemblyMeta {
+            name: "bird-flapper".to_string(),
+            iteration: 1,
+            notes: vec![
+                "Symmetrical long-arm bird flapper inspired by a simple classroom wing mechanism."
+                    .to_string(),
+                "Left and right wingtip angles change relative to the body through the cycle."
+                    .to_string(),
+            ],
+        },
+    }
 }
 
 fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
     if assembly.drives.len() != 1 {
         return Err("fixture must contain exactly one drive for the current renderer".to_string());
     }
+
+    validate_unique_entity_ids(assembly)?;
 
     for (joint_id, joint) in &assembly.joints {
         if let JointSpec::Fixed { position } = joint {
@@ -1629,14 +1811,76 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_unique_entity_ids(assembly: &AssemblySpec) -> Result<(), String> {
+    let mut seen = BTreeMap::<String, &'static str>::new();
+    for joint_id in assembly.joints.keys() {
+        validate_unique_entity_id(&mut seen, joint_id, "joint")?;
+    }
+    for part_id in assembly.parts.keys() {
+        validate_unique_entity_id(&mut seen, part_id, "part")?;
+    }
+    for drive_id in assembly.drives.keys() {
+        validate_unique_entity_id(&mut seen, drive_id, "drive")?;
+    }
+    for poi in &assembly.points_of_interest {
+        validate_unique_entity_id(&mut seen, &poi.id, "poi")?;
+    }
+    Ok(())
+}
+
+fn validate_unique_entity_id(
+    seen: &mut BTreeMap<String, &'static str>,
+    id: &str,
+    kind: &'static str,
+) -> Result<(), String> {
+    if let Some(existing_kind) = seen.insert(id.to_string(), kind) {
+        Err(format!("id collision: {id} is already used by {existing_kind}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn entity_kind_for_id(assembly: &AssemblySpec, id: &str) -> Option<&'static str> {
+    if assembly.joints.contains_key(id) {
+        Some("joint")
+    } else if assembly.parts.contains_key(id) {
+        Some("part")
+    } else if assembly.drives.contains_key(id) {
+        Some("drive")
+    } else if assembly.points_of_interest.iter().any(|poi| poi.id == id) {
+        Some("poi")
+    } else {
+        None
+    }
+}
+
+fn ensure_id_available(assembly: &AssemblySpec, id: &str) -> Result<(), String> {
+    if let Some(existing_kind) = entity_kind_for_id(assembly, id) {
+        Err(format!("id collision: {id} is already used by {existing_kind}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn missing_entity_error(assembly: &AssemblySpec, expected_kind: &str, id: &str) -> String {
+    match entity_kind_for_id(assembly, id) {
+        Some(actual_kind) => format!(
+            "{expected_kind} {id} not found; id is already used by {actual_kind}"
+        ),
+        None => format!("{expected_kind} {id} not found"),
+    }
+}
+
 fn llm_system_prompt() -> Result<String, String> {
-    let sample_fixture = serde_json::to_string_pretty(&startup_prompt_sample_fixture())
+    let sample_fixture = serde_json::to_string_pretty(&llm_prompt_reference_fixture())
         .map_err(|err| format!("failed to serialize sample fixture: {err}"))?;
     Ok(format!(
         concat!(
             "You are designing and editing a mechanism assembly.\n",
             "Respond only by calling propose_mutations.\n",
-            "Prefer small, coherent changes unless the user clearly asks for a reset.\n",
+            "TOPOLOGY IS THE FIRST TOOL. When the user asks for more joints, more linkage complexity, a different path shape, or says the trace is 'just a circle', you MUST call add_joint in that batch to introduce at least one new free joint and connect it with links. Stacking extra parallel links between the same two existing joints is NOT a substitute for new joints and will keep producing circular traces.\n",
+            "A POI traces a circle whenever every part it depends on is rigidly pinned to a single rotating crank. To get a non-circular path, the POI must ride a link whose endpoints depend on at least one joint that is not directly driven by the crank. That almost always means adding a new Free joint plus at least two links that form a closed loop through it (four-bar, crank-slider, or similar).\n",
+            "Prefer small, coherent changes unless the user clearly asks for a reset. Adding 1-3 new joints to introduce a real coupler is still a 'small coherent change' when the user is asking for more structure — do not pretend it is risky.\n",
             "Validation rules:\n",
             "- Produce exactly one drive.\n",
             "- Every fixed joint position must be finite.\n",
@@ -1649,10 +1893,48 @@ fn llm_system_prompt() -> Result<String, String> {
             "- If a linear drive includes a range, it must be finite, non-degenerate, and lie within that slider track's range.\n",
             "- Every POI must reference an existing host part, that host must be a Link, and t/perp must be finite.\n",
             "- If you use rolling-paper visualization, advance_per_cycle must be finite and > 0.\n",
+            "- The final assembly after your batch must still satisfy all validator rules above.\n",
+            "- The rendered sweep must keep every sample finite; diverging geometry is invalid.\n",
+            "Available mutation ops (emit one of these in each mutation entry):\n",
+            "- add_joint / modify_joint / remove_joint\n",
+            "- add_part / modify_part / remove_part    (parts are Link or Slider)\n",
+            "- add_drive / modify_drive / remove_drive\n",
+            "- add_poi / remove_poi\n",
+            "- note    (free-text annotation, makes no geometry change)\n",
+            "New joints are created ONLY by add_joint. Referencing an unknown joint name inside add_part does not create it and will fail validation.\n",
+            "Free joint: {{\"op\":\"add_joint\",\"id\":\"j_coupler\",\"joint\":{{\"type\":\"Free\"}}}}\n",
+            "Fixed joint: {{\"op\":\"add_joint\",\"id\":\"j_ground_r\",\"joint\":{{\"type\":\"Fixed\",\"position\":[40.0,60.0]}}}}\n",
+            "Example batch that introduces a new joint and a link that references it in one call:\n",
+            "  [{{\"op\":\"add_joint\",\"id\":\"j_coupler\",\"joint\":{{\"type\":\"Free\"}}}},\n",
+            "   {{\"op\":\"add_part\",\"id\":\"l_coupler\",\"part\":{{\"type\":\"Link\",\"a\":\"j_tip\",\"b\":\"j_coupler\",\"length\":40.0}}}}]\n",
             "Mutation rules:\n",
             "- Use add_*, modify_*, and remove_* ops atomically.\n",
             "- modify_* uses a shallow patch object.\n",
+            "- For modify_* patches, keys with null values are ignored and leave the existing field unchanged.\n",
             "- Unknown patch keys are invalid.\n",
+            "- add_* creates a new id; modify_* and remove_* require an existing id in the current assembly.\n",
+            "- Ids are globally unique across joints, parts, drives, and POIs.\n",
+            "- Entity kind comes from the operation and payload, not from id spelling.\n",
+            "- A joint and a link cannot share the same id, even inside one batch.\n",
+            "- References in links, drives, sliders, and POIs must point to elements that exist after the whole batch is applied.\n",
+            "- If a new link, slider, drive, or POI references a new element, add that referenced element in the same batch.\n",
+            "- You cannot clear to an empty assembly because the renderer requires exactly one valid drive in every accepted batch.\n",
+            "- If the user asks to clear or reset, replace the mechanism in one valid batch that still ends with exactly one drive.\n",
+            "- Each propose_mutations call is evaluated independently against the current assembly shown in the prompt.\n",
+            "- If a tool call fails, nothing from that failed batch is applied.\n",
+            "- After a failed tool call, send a complete corrected batch for the unchanged current assembly rather than assuming partial progress.\n",
+            "Trace context:\n",
+            "- Each user message may include a JSON block labeled `Latest full cycle POI traces JSON`.\n",
+            "- `source = latest_completed_live_cycle` means the trace came from the most recently completed live playback cycle.\n",
+            "- `source = artifact_sweep_fallback` means no live cycle has completed yet, so the trace is the current artifact sweep for one full cycle.\n",
+            "- `poi_traces` maps each POI id to ordered samples through one cycle.\n",
+            "- Each sample has world-space `x` and `y` coordinates in mechanism space plus normalized `phase` in [0, 1].\n",
+            "- The purpose of POIs is to inform you about the paths of specific points in the assembly. They are invisible to the user.\n",
+            "- Use this trace JSON as motion context when the user asks for behavioral or shape changes.\n",
+            "- POIs are diagnostics only. They do not create visible geometry and do not satisfy requests for wings, legs, arms, bodies, spiders, birds, or other visible structure.\n",
+            "- For morphology requests, make the visible structure with joints and parts. Do not answer with only POIs, notes, drive sample-count changes, or drive-only tweaks.\n",
+            "- The current assembly size is not a cap. You may add new joints and parts when needed.\n",
+            "- If an ambitious topology diverges, retry with a simpler visible linkage, not a POI-only proxy.\n",
             "Here is a valid sample fixture for reference. Do not copy its exact dimensions:\n",
             "{}"
         ),
@@ -1664,6 +1946,7 @@ fn generate_llm_turn(
     api_key: &str,
     base_assembly: &AssemblySpec,
     history: &[LlmHistoryMessage],
+    poi_trace_context_json: Option<&str>,
 ) -> Result<(AssemblySpec, ProposeMutationsArgs, Vec<ToolExchange>), LlmTurnError> {
     let system_prompt = llm_system_prompt().map_err(|message| LlmTurnError {
         message,
@@ -1674,6 +1957,7 @@ fn generate_llm_turn(
             message: format!("failed to serialize current assembly: {err}"),
             exchanges: Vec::new(),
         })?;
+    let current_assembly_summary = assembly_prompt_summary(base_assembly);
     let mut input = vec![serde_json::json!({
         "role": "system",
         "content": [
@@ -1687,6 +1971,7 @@ fn generate_llm_turn(
     for message in history.iter().take(history.len().saturating_sub(1)) {
         let (role, content_type) = match message.role {
             LlmHistoryRole::User => ("user", "input_text"),
+            LlmHistoryRole::Tool => ("user", "input_text"),
             LlmHistoryRole::Assistant => ("assistant", "output_text"),
         };
         input.push(serde_json::json!({
@@ -1711,11 +1996,22 @@ fn generate_llm_turn(
         "content": [
             {
                 "type": "input_text",
-                "text": format!(
-                    "Current assembly:\n{}\n\nUser request:\n{}\n\nCall propose_mutations now.",
-                    current_assembly,
-                    latest_prompt
-                )
+                "text": if let Some(poi_trace_context_json) = poi_trace_context_json {
+                    format!(
+                        "Current assembly summary:\n{}\n\nCurrent assembly:\n{}\n\nLatest full cycle POI traces JSON:\n{}\n\nUser request:\n{}\n\nCall propose_mutations now.",
+                        current_assembly_summary,
+                        current_assembly,
+                        poi_trace_context_json,
+                        latest_prompt
+                    )
+                } else {
+                    format!(
+                        "Current assembly summary:\n{}\n\nCurrent assembly:\n{}\n\nUser request:\n{}\n\nCall propose_mutations now.",
+                        current_assembly_summary,
+                        current_assembly,
+                        latest_prompt
+                    )
+                }
             }
         ]
     }));
@@ -1728,10 +2024,9 @@ fn generate_llm_turn(
         })?;
     let mut tool_input = input;
     let mut previous_response_id = None;
-    let mut last_error = None;
     let mut exchanges = Vec::new();
 
-    for _ in 0..4 {
+    for _ in 0..MAX_TOOL_CORRECTION_ATTEMPTS {
         let body = send_llm_request(&client, api_key, &tool_input, previous_response_id.as_deref())
             .map_err(|message| LlmTurnError {
                 message,
@@ -1748,16 +2043,32 @@ fn generate_llm_turn(
                 exchanges: std::mem::take(&mut exchanges),
             }
         })?;
-        let tool_args: ProposeMutationsArgs =
-            serde_json::from_str(&tool_call.arguments).map_err(|err| {
-                LlmTurnError {
-                    message: format!(
-                        "failed to parse propose_mutations arguments: {err}\n{}",
-                        trim_for_error(&tool_call.arguments, 480)
-                    ),
-                    exchanges: std::mem::take(&mut exchanges),
-                }
-            })?;
+        let pretty_arguments = pretty_json_string(&tool_call.arguments);
+        log_tool_console("arguments", &pretty_arguments);
+        let tool_args: ProposeMutationsArgs = match serde_json::from_str(&tool_call.arguments) {
+            Ok(tool_args) => tool_args,
+            Err(err) => {
+                let message = format!(
+                    "failed to parse propose_mutations arguments: {err}\n{}",
+                    trim_for_error(&tool_call.arguments, 480)
+                );
+                let tool_output = tool_call_error_output(&tool_call.call_id, &message, base_assembly);
+                let pretty_response = pretty_json_string(
+                    &tool_output
+                        .get("output")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("{}")
+                        .to_string(),
+                );
+                log_tool_console("response", &pretty_response);
+                exchanges.push(ToolExchange {
+                    arguments: pretty_arguments,
+                    response: pretty_response,
+                });
+                tool_input = vec![tool_output];
+                continue;
+            }
+        };
         match apply_mutation_batch(base_assembly, &tool_args.mutations)
             .map_err(|err| format!("mutation application failed: {err}"))
             .and_then(|assembly| {
@@ -1768,30 +2079,33 @@ fn generate_llm_turn(
                 Ok(assembly)
             }) {
             Ok(assembly) => {
+                let pretty_response = pretty_json_string(
+                    &serde_json::json!({
+                        "ok": true,
+                        "message": "mutation batch applied"
+                    })
+                    .to_string(),
+                );
+                log_tool_console("response", &pretty_response);
                 exchanges.push(ToolExchange {
-                    arguments: pretty_json_string(&tool_call.arguments),
-                    response: pretty_json_string(
-                        &serde_json::json!({
-                            "ok": true,
-                            "message": "mutation batch applied"
-                        })
-                        .to_string(),
-                    ),
+                    arguments: pretty_arguments,
+                    response: pretty_response,
                 });
                 return Ok((assembly, tool_args, exchanges));
             }
             Err(err) => {
-                last_error = Some(err.clone());
-                let tool_output = tool_call_error_output(&tool_call.call_id, &err);
+                let tool_output = tool_call_error_output(&tool_call.call_id, &err, base_assembly);
+                let pretty_response = pretty_json_string(
+                    &tool_output
+                        .get("output")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("{}")
+                        .to_string(),
+                );
+                log_tool_console("response", &pretty_response);
                 exchanges.push(ToolExchange {
-                    arguments: pretty_json_string(&tool_call.arguments),
-                    response: pretty_json_string(
-                        &tool_output
-                            .get("output")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("{}")
-                            .to_string(),
-                    ),
+                    arguments: pretty_arguments,
+                    response: pretty_response,
                 });
                 tool_input = vec![tool_output];
             }
@@ -1799,7 +2113,10 @@ fn generate_llm_turn(
     }
 
     Err(LlmTurnError {
-        message: last_error.unwrap_or_else(|| "model did not produce a valid mutation batch".to_string()),
+        message: format!(
+            "model did not produce a valid mutation batch after {} tool correction attempts",
+            MAX_TOOL_CORRECTION_ATTEMPTS
+        ),
         exchanges,
     })
 }
@@ -1857,16 +2174,258 @@ fn extract_response_id(body: &serde_json::Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn tool_call_error_output(call_id: &str, error: &str) -> serde_json::Value {
+fn tool_call_error_output(call_id: &str, error: &str, current_assembly: &AssemblySpec) -> serde_json::Value {
+    let current_assembly_json = serde_json::to_string_pretty(current_assembly)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize current assembly\"}".to_string());
+    let current_assembly_summary = assembly_prompt_summary(current_assembly);
+    let mut output = serde_json::json!({
+        "ok": false,
+        "code": "VALIDATION_FAILED",
+        "message": error,
+        "assembly_unchanged": true,
+        "guidance": tool_error_guidance(error),
+        "current_assembly_summary": current_assembly_summary,
+        "current_assembly": current_assembly_json
+    });
+    if let Some(details) = tool_error_details(error, current_assembly) {
+        output["error_details"] = details;
+    }
     serde_json::json!({
         "type": "function_call_output",
         "call_id": call_id,
-        "output": serde_json::json!({
-            "ok": false,
-            "code": "VALIDATION_FAILED",
-            "message": error
-        }).to_string()
+        "output": output.to_string()
     })
+}
+
+fn tool_error_guidance(error: &str) -> String {
+    let mut guidance =
+        "This failed batch did not apply. Retry with a complete corrected mutation batch against the unchanged current assembly below.".to_string();
+    if error.starts_with("id collision: ") {
+        guidance.push_str(
+            " Every entity id must be globally unique. If you add a joint and a visible link, give them different ids.",
+        );
+    }
+    if error.contains(" not found; id is already used by ") {
+        guidance.push_str(
+            " The id exists, but it belongs to a different entity kind than the operation expects.",
+        );
+    }
+    if error.contains("missing joint") {
+        guidance.push_str(
+            " If a new link or slider references a new joint, add that joint in the same batch.",
+        );
+    }
+    if error.contains("relaxation failed") {
+        guidance.push_str(
+            " Simplify the visible linkage geometry and lengths until it settles; do not replace visible structure with POIs.",
+        );
+    }
+    guidance
+}
+
+fn tool_error_details(error: &str, current_assembly: &AssemblySpec) -> Option<serde_json::Value> {
+    if let Some(rest) = error.strip_prefix("id collision: ") {
+        if let Some((id, existing_kind)) = rest.split_once(" is already used by ") {
+            return Some(serde_json::json!({
+                "category": "id_collision",
+                "id": id,
+                "existing_kind": existing_kind,
+                "rule": "Ids are globally unique across joints, parts, drives, and POIs.",
+                "suggested_fix": format!("Use a different id for the new entity instead of reusing {id}.")
+            }));
+        }
+    }
+
+    for expected_kind in ["joint", "part", "drive", "poi"] {
+        let prefix = format!("{expected_kind} ");
+        if let Some(rest) = error.strip_prefix(&prefix) {
+            if let Some((id, actual_kind)) = rest.split_once(" not found; id is already used by ") {
+                return Some(serde_json::json!({
+                    "category": "wrong_entity_kind",
+                    "expected_kind": expected_kind,
+                    "id": id,
+                    "actual_kind": actual_kind,
+                    "suggested_fix": format!(
+                        "Use id {id} only as a {actual_kind}, or choose a different id for the {expected_kind} operation."
+                    )
+                }));
+            }
+        }
+    }
+
+    if let Some((owner_kind, owner_id, missing_kind, missing_id)) = missing_reference_details(error) {
+        let suggested_fix = if missing_kind == "joint" {
+            format!(
+                "Add {{\"op\":\"add_joint\",\"id\":\"{missing_id}\",\"joint\":{{\"type\":\"Free\"}}}} to the same batch, or change the reference to an existing joint."
+            )
+        } else {
+            format!(
+                "Add the missing {missing_kind} {missing_id} in the same batch, or reference an existing {missing_kind}."
+            )
+        };
+        return Some(serde_json::json!({
+            "category": "missing_reference",
+            "owner_kind": owner_kind,
+            "owner_id": owner_id,
+            "missing_kind": missing_kind,
+            "missing_id": missing_id,
+            "suggested_fix": suggested_fix
+        }));
+    }
+
+    if error.contains("fixture must contain exactly one drive for the current renderer") {
+        return Some(serde_json::json!({
+            "category": "drive_count",
+            "required_drives": 1,
+            "current_drives": current_assembly.drives.len(),
+            "suggested_fix": "The accepted batch must end with exactly one drive."
+        }));
+    }
+
+    None
+}
+
+fn missing_reference_details(error: &str) -> Option<(&str, &str, &str, &str)> {
+    for prefix in ["validation failed: ", "mutation application failed: "] {
+        if let Some(rest) = error.strip_prefix(prefix) {
+            if let Some(rest) = rest.strip_prefix("part ") {
+                if let Some((owner_id, missing_id)) = rest.split_once(": missing joint ") {
+                    return Some(("part", owner_id, "joint", missing_id));
+                }
+                if let Some((owner_id, missing_id)) = rest.split_once(": missing slider joint ") {
+                    return Some(("part", owner_id, "joint", missing_id));
+                }
+            }
+            if let Some(rest) = rest.strip_prefix("drive ") {
+                if let Some((owner_id, missing_id)) = rest.split_once(": missing pivot joint ") {
+                    return Some(("drive", owner_id, "joint", missing_id));
+                }
+                if let Some((owner_id, missing_id)) = rest.split_once(": missing tip joint ") {
+                    return Some(("drive", owner_id, "joint", missing_id));
+                }
+                if let Some((owner_id, missing_id)) = rest.split_once(": missing link ") {
+                    return Some(("drive", owner_id, "part", missing_id));
+                }
+                if let Some((owner_id, missing_id)) = rest.split_once(": missing slider part ") {
+                    return Some(("drive", owner_id, "part", missing_id));
+                }
+            }
+            if let Some(rest) = rest.strip_prefix("poi ") {
+                if let Some((owner_id, missing_id)) = rest.split_once(": missing host part ") {
+                    return Some(("poi", owner_id, "part", missing_id));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn assembly_prompt_summary(assembly: &AssemblySpec) -> String {
+    let mut lines = vec![
+        format!(
+            "Counts: {} joints, {} parts, {} drives, {} POIs.",
+            assembly.joints.len(),
+            assembly.parts.len(),
+            assembly.drives.len(),
+            assembly.points_of_interest.len()
+        ),
+        "Current counts are not a limit. You may add new joints and parts in the next batch."
+            .to_string(),
+    ];
+
+    if assembly.joints.is_empty() {
+        lines.push("Joints: none.".to_string());
+    } else {
+        let joints = assembly
+            .joints
+            .iter()
+            .map(|(id, joint)| match joint {
+                JointSpec::Fixed { position } => {
+                    format!("{id}=Fixed({:.2}, {:.2})", position[0], position[1])
+                }
+                JointSpec::Free => format!("{id}=Free"),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        lines.push(format!("Joints: {joints}."));
+    }
+
+    if assembly.parts.is_empty() {
+        lines.push("Parts: none.".to_string());
+    } else {
+        let parts = assembly
+            .parts
+            .iter()
+            .map(|(id, part)| match part {
+                PartSpec::Link { a, b, length } => {
+                    format!("{id}=Link({a}->{b}, len={length:.2})")
+                }
+                PartSpec::Slider {
+                    joint,
+                    axis_origin,
+                    axis_dir,
+                    range,
+                } => format!(
+                    "{id}=Slider(joint={joint}, origin=({:.2}, {:.2}), dir=({:.2}, {:.2}), range=[{:.2}, {:.2}])",
+                    axis_origin[0], axis_origin[1], axis_dir[0], axis_dir[1], range[0], range[1]
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        lines.push(format!("Parts: {parts}."));
+    }
+
+    if assembly.drives.is_empty() {
+        lines.push("Drives: none.".to_string());
+    } else {
+        let drives = assembly
+            .drives
+            .iter()
+            .map(|(id, drive)| match &drive.kind {
+                DriveKindSpec::Angular {
+                    pivot_joint,
+                    tip_joint,
+                    link,
+                    range,
+                } => format!(
+                    "{id}=Angular(link={link}, pivot={pivot_joint}, tip={tip_joint}, range={})",
+                    format_optional_range(*range)
+                ),
+                DriveKindSpec::Linear { slider, range } => format!(
+                    "{id}=Linear(slider={slider}, range={})",
+                    format_optional_range(*range)
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        lines.push(format!("Drives: {drives}."));
+    }
+
+    if assembly.points_of_interest.is_empty() {
+        lines.push("POIs: none.".to_string());
+    } else {
+        let pois = assembly
+            .points_of_interest
+            .iter()
+            .map(|poi| {
+                format!(
+                    "{}@{}(t={:.2}, perp={:.2})",
+                    poi.id, poi.host, poi.t, poi.perp
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        lines.push(format!("POIs: {pois}."));
+    }
+
+    lines.join("\n")
+}
+
+fn format_optional_range(range: Option<[f32; 2]>) -> String {
+    match range {
+        Some([start, end]) => format!("[{start:.2}, {end:.2}]"),
+        None => "none".to_string(),
+    }
 }
 
 fn pretty_json_string(text: &str) -> String {
@@ -1875,227 +2434,400 @@ fn pretty_json_string(text: &str) -> String {
         .unwrap_or_else(|_| text.to_string())
 }
 
+fn log_tool_console(label: &str, text: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "TOOL: propose_mutations {label} {text}");
+    let _ = stderr.flush();
+}
+
 fn startup_model_name() -> String {
     std::env::var("OPENAI_MODEL").unwrap_or_else(|_| STARTUP_MODEL.to_string())
 }
 
 fn startup_prompt_sample_fixture() -> AssemblySpec {
-    let mut sample = slider_crank_fixture();
-    sample.visualization = None;
-    sample
+    short_arm_fixture()
+}
+
+fn llm_prompt_reference_fixture() -> AssemblySpec {
+    slider_crank_fixture()
 }
 
 fn propose_mutations_tool_schema() -> serde_json::Value {
-    serde_json::from_str(
-        r#"
-        {
-          "type": "function",
-          "name": "propose_mutations",
-          "description": "Propose 1-8 atomic mutations to the current assembly. Prefer small coherent changes.",
-          "strict": true,
-          "parameters": {
+    serde_json::json!({
+        "type": "function",
+        "name": "propose_mutations",
+        "description": "Propose 1-8 atomic mutations to the current assembly. Prefer small coherent changes.",
+        "strict": true,
+        "parameters": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "reasoning": { "type": "string" },
-              "mutations": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 8,
-                "items": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "op": {
-                      "type": "string",
-                      "enum": [
-                        "add_joint", "modify_joint", "remove_joint",
-                        "add_part", "modify_part", "remove_part",
-                        "add_drive", "modify_drive", "remove_drive",
-                        "add_poi", "remove_poi", "note"
-                      ]
-                    },
-                    "id": {
-                      "type": ["string", "null"]
-                    },
-                    "patch": {
-                      "type": ["object", "null"],
-                      "additionalProperties": false,
-                      "properties": {
-                        "type": { "type": ["string", "null"] },
-                        "position": {
-                          "type": ["array", "null"],
-                          "items": { "type": "number" },
-                          "minItems": 2,
-                          "maxItems": 2
-                        },
-                        "a": { "type": ["string", "null"] },
-                        "b": { "type": ["string", "null"] },
-                        "length": { "type": ["number", "null"] },
-                        "joint": { "type": ["string", "null"] },
-                        "axis_origin": {
-                          "type": ["array", "null"],
-                          "items": { "type": "number" },
-                          "minItems": 2,
-                          "maxItems": 2
-                        },
-                        "axis_dir": {
-                          "type": ["array", "null"],
-                          "items": { "type": "number" },
-                          "minItems": 2,
-                          "maxItems": 2
-                        },
-                        "range": {
-                          "type": ["array", "null"],
-                          "items": { "type": "number" },
-                          "minItems": 2,
-                          "maxItems": 2
-                        },
-                        "kind": {
-                          "type": ["object", "null"],
-                          "additionalProperties": false,
-                          "properties": {
-                            "type": { "type": "string" },
-                            "pivot_joint": { "type": ["string", "null"] },
-                            "tip_joint": { "type": ["string", "null"] },
-                            "link": { "type": ["string", "null"] },
-                            "slider": { "type": ["string", "null"] }
-                          },
-                          "required": ["type", "pivot_joint", "tip_joint", "link", "slider"]
-                        },
-                        "sweep": {
-                          "type": ["object", "null"],
-                          "additionalProperties": false,
-                          "properties": {
-                            "samples": { "type": "integer", "minimum": 2 },
-                            "direction": {
-                              "type": "string",
-                              "enum": ["Forward", "Reverse", "PingPong", "Clockwise", "CounterClockwise", "CW", "CCW"]
-                            }
-                          },
-                          "required": ["samples", "direction"]
-                        }
-                      },
-                      "required": [
-                        "type", "position", "a", "b", "length", "joint",
-                        "axis_origin", "axis_dir", "range", "kind", "sweep"
-                      ]
-                    },
-                    "joint": {
-                      "type": ["object", "null"],
-                      "additionalProperties": false,
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "enum": ["Fixed", "Free"]
-                        },
-                        "position": {
-                          "type": ["array", "null"],
-                          "items": { "type": "number" },
-                          "minItems": 2,
-                          "maxItems": 2
-                        }
-                      },
-                      "required": ["type", "position"]
-                    },
-                    "part": {
-                      "type": ["object", "null"],
-                      "additionalProperties": false,
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "enum": ["Link", "Slider"]
-                        },
-                        "a": { "type": ["string", "null"] },
-                        "b": { "type": ["string", "null"] },
-                        "length": { "type": ["number", "null"] },
-                        "joint": { "type": ["string", "null"] },
-                        "axis_origin": {
-                          "type": ["array", "null"],
-                          "items": { "type": "number" },
-                          "minItems": 2,
-                          "maxItems": 2
-                        },
-                        "axis_dir": {
-                          "type": ["array", "null"],
-                          "items": { "type": "number" },
-                          "minItems": 2,
-                          "maxItems": 2
-                        },
-                        "range": {
-                          "type": ["array", "null"],
-                          "items": { "type": "number" },
-                          "minItems": 2,
-                          "maxItems": 2
-                        }
-                      },
-                      "required": ["type", "a", "b", "length", "joint", "axis_origin", "axis_dir", "range"]
-                    },
-                    "drive": {
-                      "type": ["object", "null"],
-                      "additionalProperties": false,
-                      "properties": {
-                        "kind": {
-                          "type": "object",
-                          "additionalProperties": false,
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "enum": ["Angular", "Linear"]
-                            },
-                            "pivot_joint": { "type": ["string", "null"] },
-                            "tip_joint": { "type": ["string", "null"] },
-                            "link": { "type": ["string", "null"] },
-                            "slider": { "type": ["string", "null"] },
-                            "range": {
-                              "type": ["array", "null"],
-                              "items": { "type": "number" },
-                              "minItems": 2,
-                              "maxItems": 2
-                            }
-                          },
-                          "required": ["type", "pivot_joint", "tip_joint", "link", "slider", "range"]
-                        },
-                        "sweep": {
-                          "type": "object",
-                          "additionalProperties": false,
-                          "properties": {
-                            "samples": { "type": "integer", "minimum": 2 },
-                            "direction": {
-                              "type": "string",
-                              "enum": ["Forward", "Reverse", "PingPong", "Clockwise", "CounterClockwise", "CW", "CCW"]
-                            }
-                          },
-                          "required": ["samples", "direction"]
-                        }
-                      },
-                      "required": ["kind", "sweep"]
-                    },
-                    "poi": {
-                      "type": ["object", "null"],
-                      "additionalProperties": false,
-                      "properties": {
-                        "id": { "type": "string" },
-                        "host": { "type": "string" },
-                        "t": { "type": "number" },
-                        "perp": { "type": "number" }
-                      },
-                      "required": ["id", "host", "t", "perp"]
-                    },
-                    "text": {
-                      "type": ["string", "null"]
+                "reasoning": { "type": "string" },
+                "mutations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "anyOf": [
+                            mutation_add_joint_schema(),
+                            mutation_modify_joint_schema(),
+                            mutation_remove_with_id_schema("remove_joint"),
+                            mutation_add_part_schema(),
+                            mutation_modify_part_schema(),
+                            mutation_remove_with_id_schema("remove_part"),
+                            mutation_add_drive_schema(),
+                            mutation_modify_drive_schema(),
+                            mutation_remove_with_id_schema("remove_drive"),
+                            mutation_add_poi_schema(),
+                            mutation_remove_with_id_schema("remove_poi"),
+                            mutation_note_schema(),
+                        ]
                     }
-                  },
-                  "required": ["op", "id", "patch", "joint", "part", "drive", "poi", "text"]
                 }
-              }
             },
             "required": ["reasoning", "mutations"]
-          }
         }
-        "#,
-    )
-    .expect("propose_mutations tool schema should be valid JSON")
+    })
+}
+
+fn mutation_add_joint_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "op": { "type": "string", "enum": ["add_joint"] },
+            "id": { "type": "string" },
+            "joint": joint_spec_schema(),
+        },
+        "required": ["op", "id", "joint"]
+    })
+}
+
+fn mutation_modify_joint_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "op": { "type": "string", "enum": ["modify_joint"] },
+            "id": { "type": "string" },
+            "patch": joint_patch_schema(),
+        },
+        "required": ["op", "id", "patch"]
+    })
+}
+
+fn mutation_add_part_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "op": { "type": "string", "enum": ["add_part"] },
+            "id": { "type": "string" },
+            "part": part_spec_schema(),
+        },
+        "required": ["op", "id", "part"]
+    })
+}
+
+fn mutation_modify_part_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "op": { "type": "string", "enum": ["modify_part"] },
+            "id": { "type": "string" },
+            "patch": part_patch_schema(),
+        },
+        "required": ["op", "id", "patch"]
+    })
+}
+
+fn mutation_add_drive_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "op": { "type": "string", "enum": ["add_drive"] },
+            "id": { "type": "string" },
+            "drive": drive_spec_schema(),
+        },
+        "required": ["op", "id", "drive"]
+    })
+}
+
+fn mutation_modify_drive_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "op": { "type": "string", "enum": ["modify_drive"] },
+            "id": { "type": "string" },
+            "patch": drive_patch_schema(),
+        },
+        "required": ["op", "id", "patch"]
+    })
+}
+
+fn mutation_add_poi_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "op": { "type": "string", "enum": ["add_poi"] },
+            "poi": poi_spec_schema(),
+        },
+        "required": ["op", "poi"]
+    })
+}
+
+fn mutation_remove_with_id_schema(op: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "op": { "type": "string", "enum": [op] },
+            "id": { "type": "string" },
+        },
+        "required": ["op", "id"]
+    })
+}
+
+fn mutation_note_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "op": { "type": "string", "enum": ["note"] },
+            "text": { "type": "string" },
+        },
+        "required": ["op", "text"]
+    })
+}
+
+fn joint_spec_schema() -> serde_json::Value {
+    serde_json::json!({
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "type": { "type": "string", "enum": ["Fixed"] },
+                    "position": point2_schema(),
+                },
+                "required": ["type", "position"]
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "type": { "type": "string", "enum": ["Free"] }
+                },
+                "required": ["type"]
+            }
+        ]
+    })
+}
+
+fn joint_patch_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "type": {
+                "type": ["string", "null"],
+                "enum": ["Fixed", "Free", serde_json::Value::Null]
+            },
+            "position": nullable_point2_schema(),
+        },
+        "required": ["type", "position"]
+    })
+}
+
+fn part_spec_schema() -> serde_json::Value {
+    serde_json::json!({
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "type": { "type": "string", "enum": ["Link"] },
+                    "a": { "type": "string" },
+                    "b": { "type": "string" },
+                    "length": { "type": "number" }
+                },
+                "required": ["type", "a", "b", "length"]
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "type": { "type": "string", "enum": ["Slider"] },
+                    "joint": { "type": "string" },
+                    "axis_origin": point2_schema(),
+                    "axis_dir": point2_schema(),
+                    "range": point2_schema()
+                },
+                "required": ["type", "joint", "axis_origin", "axis_dir", "range"]
+            }
+        ]
+    })
+}
+
+fn part_patch_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "type": {
+                "type": ["string", "null"],
+                "enum": ["Link", "Slider", serde_json::Value::Null]
+            },
+            "a": { "type": ["string", "null"] },
+            "b": { "type": ["string", "null"] },
+            "length": { "type": ["number", "null"] },
+            "joint": { "type": ["string", "null"] },
+            "axis_origin": nullable_point2_schema(),
+            "axis_dir": nullable_point2_schema(),
+            "range": nullable_point2_schema()
+        },
+        "required": ["type", "a", "b", "length", "joint", "axis_origin", "axis_dir", "range"]
+    })
+}
+
+fn drive_spec_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "kind": drive_kind_schema(),
+            "sweep": sweep_schema()
+        },
+        "required": ["kind", "sweep"]
+    })
+}
+
+fn drive_patch_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "kind": nullable_drive_kind_schema(),
+            "sweep": nullable_sweep_schema()
+        },
+        "required": ["kind", "sweep"]
+    })
+}
+
+fn drive_kind_schema() -> serde_json::Value {
+    serde_json::json!({
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "type": { "type": "string", "enum": ["Angular"] },
+                    "pivot_joint": { "type": "string" },
+                    "tip_joint": { "type": "string" },
+                    "link": { "type": "string" },
+                    "range": {
+                        "type": ["array", "null"],
+                        "items": { "type": "number" },
+                        "minItems": 2,
+                        "maxItems": 2
+                    }
+                },
+                "required": ["type", "pivot_joint", "tip_joint", "link", "range"]
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "type": { "type": "string", "enum": ["Linear"] },
+                    "slider": { "type": "string" },
+                    "range": {
+                        "type": ["array", "null"],
+                        "items": { "type": "number" },
+                        "minItems": 2,
+                        "maxItems": 2
+                    }
+                },
+                "required": ["type", "slider", "range"]
+            }
+        ]
+    })
+}
+
+fn nullable_drive_kind_schema() -> serde_json::Value {
+    serde_json::json!({
+        "anyOf": [
+            drive_kind_schema(),
+            { "type": "null" }
+        ]
+    })
+}
+
+fn sweep_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "samples": { "type": "integer", "minimum": 2 },
+            "direction": {
+                "type": "string",
+                "enum": [
+                    "Forward",
+                    "Reverse",
+                    "PingPong",
+                    "Clockwise",
+                    "CounterClockwise",
+                    "CW",
+                    "CCW"
+                ]
+            }
+        },
+        "required": ["samples", "direction"]
+    })
+}
+
+fn nullable_sweep_schema() -> serde_json::Value {
+    serde_json::json!({
+        "anyOf": [
+            sweep_schema(),
+            { "type": "null" }
+        ]
+    })
+}
+
+fn poi_spec_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": { "type": "string" },
+            "host": { "type": "string" },
+            "t": { "type": "number" },
+            "perp": { "type": "number" }
+        },
+        "required": ["id", "host", "t", "perp"]
+    })
+}
+
+fn point2_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": { "type": "number" },
+        "minItems": 2,
+        "maxItems": 2
+    })
+}
+
+fn nullable_point2_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": ["array", "null"],
+        "items": { "type": "number" },
+        "minItems": 2,
+        "maxItems": 2
+    })
 }
 
 fn extract_response_text(body: &serde_json::Value) -> Option<String> {
@@ -2157,32 +2889,30 @@ fn apply_mutation_batch(
     for mutation in mutations {
         match mutation {
             StartupMutation::AddJoint { id, joint } => {
-                if assembly.joints.contains_key(id) {
-                    return Err(format!("duplicate joint id {id}"));
-                }
+                ensure_id_available(&assembly, id)?;
                 assembly.joints.insert(id.clone(), joint.clone());
             }
             StartupMutation::ModifyJoint { id, patch } => {
-                let target = assembly
-                    .joints
-                    .get_mut(id)
-                    .ok_or_else(|| format!("joint {id} not found"))?;
+                if !assembly.joints.contains_key(id) {
+                    return Err(missing_entity_error(&assembly, "joint", id));
+                }
+                let target = assembly.joints.get_mut(id).expect("joint checked above");
                 apply_shallow_patch(target, patch, &["type", "position"], "joint patch")?;
             }
             StartupMutation::RemoveJoint { id } => {
-                assembly.joints.remove(id);
+                if assembly.joints.remove(id).is_none() {
+                    return Err(missing_entity_error(&assembly, "joint", id));
+                }
             }
             StartupMutation::AddPart { id, part } => {
-                if assembly.parts.contains_key(id) {
-                    return Err(format!("duplicate part id {id}"));
-                }
+                ensure_id_available(&assembly, id)?;
                 assembly.parts.insert(id.clone(), part.clone());
             }
             StartupMutation::ModifyPart { id, patch } => {
-                let target = assembly
-                    .parts
-                    .get_mut(id)
-                    .ok_or_else(|| format!("part {id} not found"))?;
+                if !assembly.parts.contains_key(id) {
+                    return Err(missing_entity_error(&assembly, "part", id));
+                }
+                let target = assembly.parts.get_mut(id).expect("part checked above");
                 apply_shallow_patch(
                     target,
                     patch,
@@ -2191,36 +2921,36 @@ fn apply_mutation_batch(
                 )?;
             }
             StartupMutation::RemovePart { id } => {
-                assembly.parts.remove(id);
+                if assembly.parts.remove(id).is_none() {
+                    return Err(missing_entity_error(&assembly, "part", id));
+                }
             }
             StartupMutation::AddDrive { id, drive } => {
-                if assembly.drives.contains_key(id) {
-                    return Err(format!("duplicate drive id {id}"));
-                }
+                ensure_id_available(&assembly, id)?;
                 assembly.drives.insert(id.clone(), drive.clone());
             }
             StartupMutation::ModifyDrive { id, patch } => {
-                let target = assembly
-                    .drives
-                    .get_mut(id)
-                    .ok_or_else(|| format!("drive {id} not found"))?;
+                if !assembly.drives.contains_key(id) {
+                    return Err(missing_entity_error(&assembly, "drive", id));
+                }
+                let target = assembly.drives.get_mut(id).expect("drive checked above");
                 apply_shallow_patch(target, patch, &["kind", "sweep"], "drive patch")?;
             }
             StartupMutation::RemoveDrive { id } => {
-                assembly.drives.remove(id);
+                if assembly.drives.remove(id).is_none() {
+                    return Err(missing_entity_error(&assembly, "drive", id));
+                }
             }
             StartupMutation::AddPoi { poi } => {
-                if assembly
-                    .points_of_interest
-                    .iter()
-                    .any(|existing| existing.id == poi.id)
-                {
-                    return Err(format!("duplicate poi id {}", poi.id));
-                }
+                ensure_id_available(&assembly, &poi.id)?;
                 assembly.points_of_interest.push(poi.clone());
             }
             StartupMutation::RemovePoi { id } => {
+                let original_len = assembly.points_of_interest.len();
                 assembly.points_of_interest.retain(|poi| poi.id != *id);
+                if assembly.points_of_interest.len() == original_len {
+                    return Err(missing_entity_error(&assembly, "poi", id));
+                }
             }
             StartupMutation::Note { text } => {
                 if !text.trim().is_empty() {
@@ -2255,6 +2985,9 @@ where
         .as_object_mut()
         .ok_or_else(|| format!("{label}: target is not an object"))?;
     for (key, patch_value) in patch_obj {
+        if patch_value.is_null() {
+            continue;
+        }
         value_obj.insert(key.clone(), patch_value.clone());
     }
     *target = serde_json::from_value(value).map_err(|err| format!("{label}: {err}"))?;
@@ -2272,7 +3005,6 @@ fn empty_startup_assembly() -> AssemblySpec {
             name: "startup-generated".to_string(),
             iteration: 1,
             notes: Vec::new(),
-            simulation_mode: default_simulation_mode(),
         },
     }
 }
@@ -2887,7 +3619,6 @@ fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifa
     let first_drive_value = sample_drive_value(&plan, 0.0);
     let first_drive_constraint = build_drive_constraint(&assembly, &plan, first_drive_value)?;
     let mut particle_state = seed_particles(&assembly, &links, &sliders, &first_drive_constraint)?;
-    let mode = assembly.meta.simulation_mode;
 
     let mut frames = Vec::with_capacity(samples);
     let mut point_paths: BTreeMap<String, Vec<Point2>> = BTreeMap::new();
@@ -2908,17 +3639,7 @@ fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifa
         )?;
         peak_constraint_error = peak_constraint_error.max(relaxed.max_constraint_error);
         if !relaxed.settled {
-            match mode {
-                SimulationModeSpec::Strict => {
-                    return Err(format!(
-                        "relaxation failed to settle: max constraint error {:.3}",
-                        relaxed.max_constraint_error
-                    ));
-                }
-                SimulationModeSpec::Expressive => {
-                    unsettled_samples += 1;
-                }
-            }
+            unsettled_samples += 1;
         }
         particle_state = relaxed.particles;
 
@@ -3079,13 +3800,6 @@ fn sample_drive_value(plan: &DrivePlan, u: f32) -> f32 {
     plan.start_value + (plan.end_value - plan.start_value) * u
 }
 
-fn simulation_mode_label(mode: SimulationModeSpec) -> &'static str {
-    match mode {
-        SimulationModeSpec::Strict => "STRICT",
-        SimulationModeSpec::Expressive => "EXPRESSIVE",
-    }
-}
-
 fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
     let fixture = current_fixture(model);
     draw_menu_layer(
@@ -3125,6 +3839,180 @@ fn write_screen_log_snapshot(model: &Model, win: Rect) {
         return;
     }
     *last_snapshot = snapshot;
+}
+
+fn write_poi_trace_debug_json(model: &Model) {
+    let snapshot = match poi_trace_context_json(model) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            eprintln!("linkage poi trace log error: {err}");
+            return;
+        }
+    };
+    let mutex = POI_TRACE_LAST_SNAPSHOT.get_or_init(|| Mutex::new(String::new()));
+    let mut last_snapshot = match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if *last_snapshot == snapshot {
+        return;
+    }
+    if let Err(err) = fs::write(POI_TRACE_DEBUG_PATH, &snapshot) {
+        eprintln!("linkage poi trace log error: failed to write {POI_TRACE_DEBUG_PATH}: {err}");
+        return;
+    }
+    *last_snapshot = snapshot;
+}
+
+fn poi_trace_context_json(model: &Model) -> Result<String, String> {
+    serde_json::to_string_pretty(&poi_trace_context_value(model))
+        .map_err(|err| format!("failed to serialize poi trace context: {err}"))
+}
+
+fn poi_trace_context_value(model: &Model) -> serde_json::Value {
+    let fixture_label = current_fixture(model).label.clone();
+    let artifact = current_artifact(model);
+    let source = if !model.latest_full_cycle_traces.is_empty() {
+        "latest_completed_live_cycle"
+    } else if artifact.is_some() {
+        "artifact_sweep_fallback"
+    } else {
+        "none"
+    };
+    let poi_traces = if !model.latest_full_cycle_traces.is_empty() {
+        live_cycle_trace_json(&model.latest_full_cycle_traces)
+    } else if let Some(artifact) = artifact {
+        artifact_point_paths_json(&artifact.telemetry.point_paths)
+    } else {
+        serde_json::json!({})
+    };
+    serde_json::json!({
+        "fixture_label": fixture_label,
+        "source": source,
+        "playback_progress": round2(model.playback_progress),
+        "live_trace_u": round2(model.live_trace_u),
+        "poi_traces": poi_traces,
+    })
+}
+
+fn live_cycle_trace_json(traces: &BTreeMap<String, Vec<TraceSample>>) -> serde_json::Value {
+    let mut serialized = serde_json::Map::new();
+    for (poi_id, samples) in traces {
+        let values: Vec<serde_json::Value> = resample_trace_samples(samples, POI_TRACE_DEBUG_SAMPLES)
+            .iter()
+            .map(|sample| {
+                serde_json::json!({
+                    "x": round2(sample.point.x),
+                    "y": round2(sample.point.y),
+                    "phase": round2(sample.phase),
+                })
+            })
+            .collect();
+        serialized.insert(poi_id.clone(), serde_json::Value::Array(values));
+    }
+    serde_json::Value::Object(serialized)
+}
+
+fn artifact_point_paths_json(traces: &BTreeMap<String, Vec<Point2>>) -> serde_json::Value {
+    let mut serialized = serde_json::Map::new();
+    for (poi_id, points) in traces {
+        let values: Vec<serde_json::Value> = resample_point_path(points, POI_TRACE_DEBUG_SAMPLES)
+            .iter()
+            .map(|sample| {
+                serde_json::json!({
+                    "x": round2(sample.point.x),
+                    "y": round2(sample.point.y),
+                    "phase": round2(sample.phase),
+                })
+            })
+            .collect();
+        serialized.insert(poi_id.clone(), serde_json::Value::Array(values));
+    }
+    serde_json::Value::Object(serialized)
+}
+
+fn resample_trace_samples(samples: &[TraceSample], count: usize) -> Vec<TraceSample> {
+    if samples.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    if samples.len() == 1 {
+        return (0..count)
+            .map(|index| {
+                let phase = if count == 1 {
+                    samples[0].phase
+                } else {
+                    index as f32 / (count - 1) as f32
+                };
+                TraceSample {
+                    point: samples[0].point,
+                    phase,
+                }
+            })
+            .collect();
+    }
+
+    (0..count)
+        .map(|index| {
+            let target_phase = if count == 1 {
+                0.0
+            } else {
+                index as f32 / (count - 1) as f32
+            };
+            interpolate_trace_sample(samples, target_phase)
+        })
+        .collect()
+}
+
+fn resample_point_path(points: &[Point2], count: usize) -> Vec<TraceSample> {
+    if points.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    let denom = points.len().saturating_sub(1).max(1) as f32;
+    let samples: Vec<TraceSample> = points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| TraceSample {
+            point: *point,
+            phase: index as f32 / denom,
+        })
+        .collect();
+    resample_trace_samples(&samples, count)
+}
+
+fn interpolate_trace_sample(samples: &[TraceSample], target_phase: f32) -> TraceSample {
+    let first = samples[0];
+    if target_phase <= first.phase {
+        return TraceSample {
+            point: first.point,
+            phase: target_phase,
+        };
+    }
+
+    for window in samples.windows(2) {
+        let a = window[0];
+        let b = window[1];
+        if target_phase <= b.phase {
+            let span = (b.phase - a.phase).max(0.000_1);
+            let t = ((target_phase - a.phase) / span).clamp(0.0, 1.0);
+            return TraceSample {
+                point: pt2(
+                    a.point.x + (b.point.x - a.point.x) * t,
+                    a.point.y + (b.point.y - a.point.y) * t,
+                ),
+                phase: target_phase,
+            };
+        }
+    }
+
+    let last = *samples.last().expect("non-empty trace samples");
+    TraceSample {
+        point: last.point,
+        phase: target_phase,
+    }
+}
+
+fn round2(value: f32) -> f32 {
+    (value * 100.0).round() / 100.0
 }
 
 fn screen_text_snapshot(model: &Model, win: Rect) -> String {
@@ -3201,8 +4089,7 @@ fn collect_screen_text_lines(model: &Model, win: Rect) -> Vec<String> {
                     })
                     .unwrap_or_else(|| "drive n/a".to_string());
                 lines.push(format!(
-                    "{}  |  t {:.2}  |  u {:.2}  |  {drive_status}  |  err {:.2}{}",
-                    simulation_mode_label(artifact.assembly.meta.simulation_mode),
+                    "LIVE  |  t {:.2}  |  u {:.2}  |  {drive_status}  |  err {:.2}{}",
                     model.playback_progress,
                     model.live_trace_u,
                     live.max_constraint_error,
@@ -3533,8 +4420,7 @@ fn draw_render_pane(
                 })
                 .unwrap_or_else(|| "drive n/a".to_string());
             let status = format!(
-                "{}  |  t {:.2}  |  u {:.2}  |  {drive_status}  |  err {:.2}{}",
-                simulation_mode_label(artifact.assembly.meta.simulation_mode),
+                "LIVE  |  t {:.2}  |  u {:.2}  |  {drive_status}  |  err {:.2}{}",
                 playback_progress,
                 live_trace_u,
                 live.max_constraint_error,
@@ -4447,7 +5333,6 @@ mod tests {
                 name: "no-slider".to_string(),
                 iteration: 1,
                 notes: Vec::new(),
-                simulation_mode: SimulationModeSpec::Expressive,
             },
         };
 
@@ -4506,7 +5391,6 @@ mod tests {
                 name: "floating-arm".to_string(),
                 iteration: 1,
                 notes: Vec::new(),
-                simulation_mode: SimulationModeSpec::Expressive,
             },
         };
 
@@ -4515,16 +5399,9 @@ mod tests {
     }
 
     #[test]
-    fn expressive_mode_commits_branchy_drawable_sweep() {
-        let mut strict = expressive_branchy_fixture();
-        strict.meta.simulation_mode = SimulationModeSpec::Strict;
-        match build_sweep_artifact(strict, 1) {
-            Ok(_) => panic!("strict mode should reject the impossible brace fixture"),
-            Err(err) => assert!(err.contains("failed to settle") || err.contains("diverged")),
-        }
-
+    fn branchy_fixture_commits_drawable_sweep() {
         let artifact = build_sweep_artifact(expressive_branchy_fixture(), 1)
-            .expect("expressive mode should keep a drawable artifact");
+            .expect("branchy fixture should keep a drawable artifact");
         assert!(!artifact.frames.is_empty());
         assert!(artifact.telemetry.unsettled_samples > 0);
         assert!(artifact.telemetry.peak_constraint_error > RELAXATION_TOLERANCE);
@@ -4537,6 +5414,42 @@ mod tests {
             build_sweep_artifact(expressive_chain_fixture(), 1).expect("expressive chain fixture");
         assert_eq!(artifact.telemetry.point_paths.len(), 3);
         assert_eq!(artifact.telemetry.unsettled_samples, 0);
+    }
+
+    #[test]
+    fn bird_flapper_fixture_builds_and_changes_wing_angle() {
+        let assembly = bird_flapper_fixture();
+        validate_fixture(&assembly).expect("bird fixture should validate");
+        let artifact = build_sweep_artifact(assembly, 1).expect("bird fixture should build");
+        assert!(!artifact.frames.is_empty());
+        assert_eq!(artifact.telemetry.point_paths.len(), 2);
+
+        let mut min_relative = f32::INFINITY;
+        let mut max_relative = f32::NEG_INFINITY;
+        for frame in &artifact.frames {
+            let pivot = frame
+                .joint_positions
+                .get("j_pivot")
+                .copied()
+                .expect("pivot");
+            let tip = frame.joint_positions.get("j_tip").copied().expect("tip");
+            let left = frame
+                .joint_positions
+                .get("j_left_wing")
+                .copied()
+                .expect("left wing");
+            let body = tip - pivot;
+            let wing = left - tip;
+            let relative = normalize_angle(wing.angle() - body.angle());
+            min_relative = min_relative.min(relative);
+            max_relative = max_relative.max(relative);
+        }
+
+        assert!(
+            max_relative - min_relative > 0.2,
+            "expected visible wing-angle change, got range {}",
+            max_relative - min_relative
+        );
     }
 
     #[test]
@@ -4573,14 +5486,6 @@ mod tests {
         let end =
             rolling_paper_position(path[path.len() - 1], direction, advance_per_cycle, 1.0, 0.0);
         assert!(end.y > start.y + 100.0);
-    }
-
-    #[test]
-    fn unsolved_fixture_fails_relaxation() {
-        match build_sweep_artifact(unsolved_slider_crank_fixture(), 1) {
-            Ok(_) => panic!("fixture should fail"),
-            Err(err) => assert!(err.contains("relaxation")),
-        }
     }
 
     #[test]
@@ -4692,6 +5597,210 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trim_llm_history_drops_non_user_prefix_after_trimming() {
+        let mut history = Vec::new();
+        history.push(LlmHistoryMessage {
+            role: LlmHistoryRole::Tool,
+            text: "tool".to_string(),
+        });
+        for idx in 0..170 {
+            history.push(LlmHistoryMessage {
+                role: if idx % 3 == 0 {
+                    LlmHistoryRole::User
+                } else if idx % 3 == 1 {
+                    LlmHistoryRole::Tool
+                } else {
+                    LlmHistoryRole::Assistant
+                },
+                text: format!("m{idx}"),
+            });
+        }
+
+        trim_llm_history(&mut history);
+
+        assert!(history.len() <= MAX_LLM_HISTORY_MESSAGES);
+        assert!(matches!(
+            history.first().map(|message| message.role),
+            Some(LlmHistoryRole::User)
+        ));
+    }
+
+    #[test]
+    fn startup_prompt_fixture_is_a_short_driven_arm() {
+        let assembly = startup_prompt_sample_fixture();
+        assert_eq!(assembly.joints.len(), 2);
+        assert_eq!(assembly.parts.len(), 1);
+        assert_eq!(assembly.drives.len(), 1);
+        assert!(assembly.points_of_interest.is_empty());
+        match assembly.parts.get("l_arm") {
+            Some(PartSpec::Link { a, b, length }) => {
+                assert_eq!(a, "j_pivot");
+                assert_eq!(b, "j_tip");
+                assert_eq!(length.to_bits(), 36.0f32.to_bits());
+            }
+            _ => panic!("startup fixture should contain l_arm"),
+        }
+        match assembly.drives.get("d_arm") {
+            Some(DriveSpec {
+                kind:
+                    DriveKindSpec::Angular {
+                        pivot_joint,
+                        tip_joint,
+                        link,
+                        range,
+                    },
+                ..
+            }) => {
+                assert_eq!(pivot_joint, "j_pivot");
+                assert_eq!(tip_joint, "j_tip");
+                assert_eq!(link, "l_arm");
+                assert!(range.is_none());
+            }
+            _ => panic!("startup fixture should contain d_arm"),
+        }
+    }
+
+    #[test]
+    fn propose_mutations_schema_is_accepted_by_openai() {
+        dotenvy::dotenv().ok();
+        let api_key =
+            std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set for schema test");
+        let assembly_json = serde_json::to_string_pretty(&startup_prompt_sample_fixture())
+            .expect("sample fixture should serialize");
+        let input = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "You are designing and editing a mechanism assembly. Respond only by calling propose_mutations."
+                    }
+                ]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!(
+                            "Current assembly:\n{}\n\nUser request:\nAdd a note saying schema test.\n\nCall propose_mutations now.",
+                            assembly_json
+                        )
+                    }
+                ]
+            }),
+        ];
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(45))
+            .build()
+            .expect("OpenAI client");
+        let body = send_llm_request(&client, &api_key, &input, None)
+            .expect("OpenAI should accept propose_mutations schema");
+        assert!(
+            extract_function_call(&body, "propose_mutations").is_some(),
+            "expected tool call in OpenAI response: {body}"
+        );
+    }
+
+    #[test]
+    fn propose_mutations_tool_history_is_accepted_by_openai() {
+        dotenvy::dotenv().ok();
+        let api_key =
+            std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set for schema test");
+        let history = vec![
+            LlmHistoryMessage {
+                role: LlmHistoryRole::User,
+                text: "Describe the current linkage.".to_string(),
+            },
+            LlmHistoryMessage {
+                role: LlmHistoryRole::Tool,
+                text: "propose_mutations arguments\n{\n  \"reasoning\": \"Describe only.\",\n  \"mutations\": [\n    {\n      \"op\": \"note\",\n      \"text\": \"Current linkage is a slider-crank.\"\n    }\n  ]\n}\n\npropose_mutations response\n{\n  \"ok\": true,\n  \"message\": \"mutation batch applied\"\n}".to_string(),
+            },
+            LlmHistoryMessage {
+                role: LlmHistoryRole::Assistant,
+                text: "Current linkage is a slider-crank.".to_string(),
+            },
+            LlmHistoryMessage {
+                role: LlmHistoryRole::User,
+                text: "Shorten the crank by 10%.".to_string(),
+            },
+        ];
+
+        let (assembly, _args, _exchanges) =
+            match generate_llm_turn(&api_key, &startup_prompt_sample_fixture(), &history, None) {
+                Ok(result) => result,
+                Err(err) => panic!(
+                    "OpenAI should accept tool history in prompt context: {}",
+                    err.message
+                ),
+            };
+        assert_eq!(assembly.drives.len(), 1);
+    }
+
+    #[test]
+    fn fixture_validation_rejects_global_id_collisions() {
+        let mut assembly = slider_crank_fixture();
+        let crank = assembly.parts.remove("l_crank").expect("crank link");
+        assembly.parts.insert("j_pivot".to_string(), crank);
+
+        let err = validate_fixture(&assembly).expect_err("id collision should fail");
+        assert!(err.contains("id collision: j_pivot is already used by joint"), "{err}");
+    }
+
+    #[test]
+    fn llm_prompt_explains_poi_limits_and_global_ids() {
+        let prompt = llm_system_prompt().expect("prompt");
+        assert!(prompt.contains("Ids are globally unique across joints, parts, drives, and POIs"));
+        assert!(prompt.contains("Entity kind comes from the operation and payload"));
+        assert!(prompt.contains("POIs are diagnostics only"));
+        assert!(prompt.contains("The current assembly size is not a cap"));
+        assert!(prompt.contains("If a new link, slider, drive, or POI references a new element, add that referenced element in the same batch"));
+    }
+
+    #[test]
+    fn tool_error_guidance_adds_missing_joint_hint() {
+        let guidance = tool_error_guidance("validation failed: part l_leg: missing joint j_knee");
+        assert!(guidance.contains("add that joint in the same batch"), "{guidance}");
+    }
+
+    #[test]
+    fn tool_error_guidance_adds_id_collision_hint() {
+        let guidance = tool_error_guidance("id collision: j_end is already used by joint");
+        assert!(guidance.contains("globally unique"), "{guidance}");
+    }
+
+    #[test]
+    fn tool_error_guidance_adds_relaxation_hint() {
+        let guidance =
+            tool_error_guidance("relaxation failed: relaxation failed to settle: max constraint error 32.570");
+        assert!(guidance.contains("do not replace visible structure with POIs"), "{guidance}");
+    }
+
+    #[test]
+    fn tool_error_details_reports_wrong_entity_kind() {
+        let details = tool_error_details(
+            "part j_end not found; id is already used by joint",
+            &slider_crank_fixture(),
+        )
+        .expect("details");
+        assert_eq!(details["category"], "wrong_entity_kind");
+        assert_eq!(details["expected_kind"], "part");
+        assert_eq!(details["actual_kind"], "joint");
+    }
+
+    #[test]
+    fn tool_error_details_reports_missing_reference() {
+        let details = tool_error_details(
+            "validation failed: part l_leg: missing joint j_knee",
+            &slider_crank_fixture(),
+        )
+        .expect("details");
+        assert_eq!(details["category"], "missing_reference");
+        assert_eq!(details["owner_kind"], "part");
+        assert_eq!(details["missing_kind"], "joint");
+    }
+
     fn frame_signature(frames: &[SolvedFrame]) -> Vec<u32> {
         let mut signature = Vec::new();
         for frame in frames {
@@ -4709,5 +5818,16 @@ mod tests {
             }
         }
         signature
+    }
+
+    fn normalize_angle(angle: f32) -> f32 {
+        let mut wrapped = angle;
+        while wrapped <= -PI {
+            wrapped += TAU;
+        }
+        while wrapped > PI {
+            wrapped -= TAU;
+        }
+        wrapped
     }
 }

@@ -547,8 +547,8 @@ next_pos = pos + (pos - prev_pos) * damping + accel * dt * dt;
   - `SliderTrack` keeps a joint on a line and inside its travel range.
   - `AngularDriveTarget` projects a driven crank toward a target angle.
   - `LinearDriveTarget` projects a slider joint toward a target position on its track.
-- A sample is considered converged enough for strict mode when max correction and max constraint error both fall below tolerance before the iteration budget is exhausted.
-- In normal expressive mode, the engine may still publish a sample sequence that does not fully settle, as long as the artifact is drawable and the telemetry remains meaningful.
+- A sample is considered fully settled when max correction and max constraint error both fall below tolerance before the iteration budget is exhausted.
+- The engine may still publish a sample sequence that does not fully settle, as long as the artifact is drawable and the telemetry remains meaningful.
 - The first sample of a sweep is warm-started from a deterministic seed assembly pose; subsequent samples warm-start from the previous sample so sweeps remain coherent and cheap.
 - This choice is intentional: the same particle-and-constraint machinery can later grow from rigid linkages into ropes, textiles, and soft bodies without replacing the simulation core.
 
