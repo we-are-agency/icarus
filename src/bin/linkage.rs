@@ -96,6 +96,9 @@ struct SweepArtifact {
 
 struct SweepTelemetry {
     point_paths: BTreeMap<String, Vec<Point2>>,
+    unsettled_samples: u32,
+    peak_constraint_error: f32,
+    notes: Vec<String>,
 }
 
 struct SolvedFrame {
@@ -166,6 +169,7 @@ enum DriveConstraint {
 struct RelaxationResult {
     particles: BTreeMap<String, ParticleState>,
     max_constraint_error: f32,
+    settled: bool,
 }
 
 struct SolvedAssembly {
@@ -306,6 +310,25 @@ struct AssemblyMeta {
     name: String,
     iteration: u32,
     notes: Vec<String>,
+    #[serde(
+        default = "default_simulation_mode",
+        skip_serializing_if = "simulation_mode_is_default"
+    )]
+    simulation_mode: SimulationModeSpec,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+enum SimulationModeSpec {
+    Strict,
+    Expressive,
+}
+
+fn default_simulation_mode() -> SimulationModeSpec {
+    SimulationModeSpec::Expressive
+}
+
+fn simulation_mode_is_default(mode: &SimulationModeSpec) -> bool {
+    *mode == default_simulation_mode()
 }
 
 #[derive(Deserialize)]
@@ -662,9 +685,11 @@ fn build_fixture_presentations() -> Result<
     let (startup_fixture, startup_generation_rx) = startup_fixture_slot();
     let fixtures = vec![
         startup_fixture,
-        build_fixture_presentation("2 VALID", slider_crank_fixture())?,
+        build_fixture_presentation("2 STRICT", slider_crank_fixture())?,
         build_fixture_presentation("3 BAD REF", invalid_reference_fixture())?,
         build_fixture_presentation("4 UNSOLVED", unsolved_slider_crank_fixture())?,
+        build_fixture_presentation("5 CHAINY", expressive_chain_fixture())?,
+        build_fixture_presentation("6 BRANCHY", expressive_branchy_fixture())?,
     ];
 
     Ok((fixtures, startup_generation_rx))
@@ -838,6 +863,7 @@ fn slider_crank_fixture() -> AssemblySpec {
             name: "p1-slider-crank".to_string(),
             iteration: 1,
             notes: vec!["P1 deterministic relaxation fixture".to_string()],
+            simulation_mode: SimulationModeSpec::Strict,
         },
     }
 }
@@ -859,6 +885,88 @@ fn unsolved_slider_crank_fixture() -> AssemblySpec {
     }
     assembly.meta.name = "p1-unsolved-slider-crank".to_string();
     assembly.meta.notes = vec!["Intentional relaxation range failure".to_string()];
+    assembly.meta.simulation_mode = SimulationModeSpec::Strict;
+    assembly
+}
+
+fn expressive_chain_fixture() -> AssemblySpec {
+    let mut assembly = slider_crank_fixture();
+    assembly
+        .joints
+        .insert("j_mid_a".to_string(), JointSpec::Free);
+    assembly
+        .joints
+        .insert("j_mid_b".to_string(), JointSpec::Free);
+    assembly.parts.remove("l_coupler");
+    assembly.parts.insert(
+        "l_chain_a".to_string(),
+        PartSpec::Link {
+            a: "j_tip".to_string(),
+            b: "j_mid_a".to_string(),
+            length: 78.0,
+        },
+    );
+    assembly.parts.insert(
+        "l_chain_b".to_string(),
+        PartSpec::Link {
+            a: "j_mid_a".to_string(),
+            b: "j_mid_b".to_string(),
+            length: 82.0,
+        },
+    );
+    assembly.parts.insert(
+        "l_chain_c".to_string(),
+        PartSpec::Link {
+            a: "j_mid_b".to_string(),
+            b: "j_slide".to_string(),
+            length: 86.0,
+        },
+    );
+    assembly.points_of_interest = vec![
+        PointOfInterestSpec {
+            id: "poi_chain_a".to_string(),
+            host: "l_chain_a".to_string(),
+            t: 0.55,
+            perp: 0.0,
+        },
+        PointOfInterestSpec {
+            id: "poi_chain_b".to_string(),
+            host: "l_chain_b".to_string(),
+            t: 0.45,
+            perp: 0.0,
+        },
+        PointOfInterestSpec {
+            id: "poi_chain_c".to_string(),
+            host: "l_chain_c".to_string(),
+            t: 0.60,
+            perp: 0.0,
+        },
+    ];
+    assembly.meta.name = "p3-expressive-chain".to_string();
+    assembly.meta.notes = vec![
+        "Three-link expressive chain between the crank tip and the slider".to_string(),
+        "Ambiguous folds are allowed".to_string(),
+    ];
+    assembly.meta.simulation_mode = SimulationModeSpec::Expressive;
+    assembly
+}
+
+fn expressive_branchy_fixture() -> AssemblySpec {
+    let mut assembly = expressive_chain_fixture();
+    assembly.parts.insert(
+        "l_brace".to_string(),
+        PartSpec::Link {
+            a: "j_tip".to_string(),
+            b: "j_mid_b".to_string(),
+            length: 200.0,
+        },
+    );
+    assembly.meta.name = "p3-branchy-impossible-brace".to_string();
+    assembly.meta.notes = vec![
+        "Impossible brace forces branchy, under-settled motion".to_string(),
+        "Expressive mode keeps the drawable artifact instead of failing hard".to_string(),
+    ];
+    assembly.meta.simulation_mode = SimulationModeSpec::Expressive;
     assembly
 }
 
@@ -999,7 +1107,6 @@ fn generate_startup_fixture(api_key: &str) -> Result<AssemblySpec, String> {
             "Use add_* mutations to construct the full startup fixture in one batch.\n",
             "For this cold start, 6-12 ops is acceptable.\n",
             "Constraints:\n",
-            "- Exactly one slider-crank topology: one fixed pivot joint, one crank link, one coupler link, one slider track, one drive.\n",
             "- Keep the slider axis horizontal and its range increasing.\n",
             "- Use one angular drive.\n",
             "- If the angular drive omits range, it must stay relaxable through a full rotation.\n",
@@ -1366,6 +1473,7 @@ fn empty_startup_assembly() -> AssemblySpec {
             name: "startup-generated".to_string(),
             iteration: 1,
             notes: Vec::new(),
+            simulation_mode: default_simulation_mode(),
         },
     }
 }
@@ -1647,14 +1755,24 @@ fn relax_particles(
             return Ok(RelaxationResult {
                 particles,
                 max_constraint_error,
+                settled: true,
             });
         }
     }
 
-    Err(format!(
-        "relaxation failed to settle: max constraint error {:.3}",
-        max_constraint_error
-    ))
+    if !max_constraint_error.is_finite() {
+        return Err("relaxation diverged".to_string());
+    }
+
+    for particle in particles.values_mut() {
+        particle.prev_pos = particle.pos;
+    }
+
+    Ok(RelaxationResult {
+        particles,
+        max_constraint_error,
+        settled: false,
+    })
 }
 
 fn project_fixed_constraints(
@@ -1883,9 +2001,12 @@ fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifa
     let first_drive_value = sample_drive_value(&plan, 0.0);
     let first_drive_constraint = build_drive_constraint(&assembly, &plan, first_drive_value)?;
     let mut particle_state = seed_particles(&assembly, &links, &sliders, &first_drive_constraint)?;
+    let mode = assembly.meta.simulation_mode;
 
     let mut frames = Vec::with_capacity(samples);
     let mut point_paths: BTreeMap<String, Vec<Point2>> = BTreeMap::new();
+    let mut unsettled_samples = 0u32;
+    let mut peak_constraint_error = 0.0f32;
 
     for sample_idx in 0..samples {
         let denom = (samples - 1).max(1) as f32;
@@ -1899,6 +2020,20 @@ fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifa
             &sliders,
             &drive_constraint,
         )?;
+        peak_constraint_error = peak_constraint_error.max(relaxed.max_constraint_error);
+        if !relaxed.settled {
+            match mode {
+                SimulationModeSpec::Strict => {
+                    return Err(format!(
+                        "relaxation failed to settle: max constraint error {:.3}",
+                        relaxed.max_constraint_error
+                    ));
+                }
+                SimulationModeSpec::Expressive => {
+                    unsettled_samples += 1;
+                }
+            }
+        }
         particle_state = relaxed.particles;
 
         let joint_positions: BTreeMap<String, Point2> = particle_state
@@ -1925,10 +2060,26 @@ fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifa
         }
     }
 
+    let mut notes = Vec::new();
+    if unsettled_samples > 0 {
+        notes.push(format!(
+            "{} / {} samples stayed loose enough to read as expressive motion",
+            unsettled_samples, samples
+        ));
+        if peak_constraint_error > 2.0 {
+            notes.push("Branch switching, snaps, or wobble are likely.".to_string());
+        }
+    }
+
     Ok(SweepArtifact {
         assembly: Arc::new(assembly),
         frames,
-        telemetry: SweepTelemetry { point_paths },
+        telemetry: SweepTelemetry {
+            point_paths,
+            unsettled_samples,
+            peak_constraint_error,
+            notes,
+        },
         turn,
         reset_phase: false,
         cycle_seconds: plan.cycle_seconds,
@@ -2040,6 +2191,13 @@ fn drive_plan(
 
 fn sample_drive_value(plan: &DrivePlan, u: f32) -> f32 {
     plan.start_value + (plan.end_value - plan.start_value) * u
+}
+
+fn simulation_mode_label(mode: SimulationModeSpec) -> &'static str {
+    match mode {
+        SimulationModeSpec::Strict => "STRICT",
+        SimulationModeSpec::Expressive => "EXPRESSIVE",
+    }
 }
 
 fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
@@ -2220,7 +2378,13 @@ fn draw_render_pane(
     let subtitle = match fixture.status {
         FixtureStatus::Loading(_) => "render loop stays live while the request runs",
         FixtureStatus::Solved(_) => {
-            if playback_paused {
+            let artifact = match &fixture.status {
+                FixtureStatus::Solved(artifact) => artifact,
+                _ => unreachable!(),
+            };
+            if artifact.telemetry.unsettled_samples > 0 {
+                "expressive mode keeps drawable under-settled motion live"
+            } else if playback_paused {
                 "space resumes playback"
             } else {
                 "space pauses playback"
@@ -2280,13 +2444,26 @@ fn draw_render_pane(
                     format!("{label} {:.2}", value)
                 })
                 .unwrap_or_else(|| "drive n/a".to_string());
-            let status = format!("u {:.2}  |  {drive_status}", frame.u);
+            let status = format!(
+                "{}  |  u {:.2}  |  {drive_status}  |  err {:.2}",
+                simulation_mode_label(artifact.assembly.meta.simulation_mode),
+                frame.u,
+                artifact.telemetry.peak_constraint_error
+            );
             draw.text(&status)
                 .x_y(text_x, rect.top() - 50.0)
                 .w_h(text_w, PANE_LINE_H)
                 .font_size(8)
                 .color(rgba(1.0, 1.0, 1.0, 0.34))
                 .left_justify();
+            if let Some(note) = artifact.telemetry.notes.first() {
+                draw.text(note)
+                    .x_y(text_x, rect.top() - 64.0)
+                    .w_h(text_w, PANE_LINE_H * 2.0)
+                    .font_size(8)
+                    .color(rgba(1.0, 1.0, 1.0, 0.46))
+                    .left_justify();
+            }
         }
         FixtureStatus::ValidationError(message) => {
             draw_error_state(&local_draw, local_rect, "VALIDATOR", message);
@@ -2974,6 +3151,31 @@ mod tests {
         assert_eq!(plan.start_value.to_bits(), (-20.0f32).to_bits());
         assert_eq!(plan.end_value.to_bits(), 180.0f32.to_bits());
         assert_eq!(plan.cycle_seconds.to_bits(), 1.5f32.to_bits());
+    }
+
+    #[test]
+    fn expressive_mode_commits_branchy_drawable_sweep() {
+        let mut strict = expressive_branchy_fixture();
+        strict.meta.simulation_mode = SimulationModeSpec::Strict;
+        match build_sweep_artifact(strict, 1) {
+            Ok(_) => panic!("strict mode should reject the impossible brace fixture"),
+            Err(err) => assert!(err.contains("failed to settle") || err.contains("diverged")),
+        }
+
+        let artifact = build_sweep_artifact(expressive_branchy_fixture(), 1)
+            .expect("expressive mode should keep a drawable artifact");
+        assert!(!artifact.frames.is_empty());
+        assert!(artifact.telemetry.unsettled_samples > 0);
+        assert!(artifact.telemetry.peak_constraint_error > RELAXATION_TOLERANCE);
+        assert!(!artifact.telemetry.notes.is_empty());
+    }
+
+    #[test]
+    fn expressive_three_link_chain_builds_multiple_poi_paths() {
+        let artifact =
+            build_sweep_artifact(expressive_chain_fixture(), 1).expect("expressive chain fixture");
+        assert_eq!(artifact.telemetry.point_paths.len(), 3);
+        assert_eq!(artifact.telemetry.unsettled_samples, 0);
     }
 
     #[test]
