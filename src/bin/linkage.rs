@@ -1,9 +1,10 @@
 use nannou::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, OnceLock};
 
 const WINDOW_W: u32 = 1280;
@@ -16,6 +17,13 @@ const PANE_LINE_H: f32 = 12.0;
 const SPEC_RATIO: f32 = 0.38;
 const GRID_STEP: f32 = 36.0;
 const RENDER_VIEW_Y_OFFSET: f32 = 10.0;
+const STARTUP_MODEL: &str = "gpt-5.3-codex";
+const MAX_TRACE_CYCLE_ENTITIES: usize = 256;
+const RELAXATION_ITERATIONS: usize = 96;
+const RELAXATION_TOLERANCE: f32 = 0.001;
+const RELAXATION_DAMPING: f32 = 0.98;
+const RELAXATION_DT: f32 = 1.0;
+const RELAXATION_DIVERGENCE_LIMIT: f32 = 10_000.0;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
@@ -32,12 +40,18 @@ struct Model {
     fixtures: Vec<FixturePresentation>,
     selected_fixture: usize,
     playback_phase: f32,
+    playback_progress: f32,
     playback_paused: bool,
+    live_trace_cycle: u32,
+    live_trace_u: f32,
     active_artifact_turn: Option<u32>,
     headless_capture_state: Cell<HeadlessCaptureState>,
     headless_capture_result: Arc<AtomicU8>,
     headless_proxy: Option<nannou::app::Proxy>,
     spec_scroll_px: f32,
+    startup_generation_rx: Option<Receiver<StartupGenerationResult>>,
+    trace_cycle_entities: Vec<TraceCycleEntity>,
+    emitted_trace_cycles: u32,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -48,15 +62,27 @@ enum HeadlessCaptureState {
 }
 
 struct FixturePresentation {
-    label: &'static str,
+    label: String,
     status: FixtureStatus,
     json_lines: Vec<String>,
 }
 
 enum FixtureStatus {
+    Loading(String),
     Solved(Arc<SweepArtifact>),
     ValidationError(String),
-    SolverError(String),
+    RelaxationError(String),
+    GenerationError(String),
+}
+
+struct StartupGenerationResult {
+    fixture: FixturePresentation,
+}
+
+struct TraceCycleEntity {
+    completion_progress: f32,
+    color_index: usize,
+    points: Vec<Point2>,
 }
 
 struct SweepArtifact {
@@ -94,11 +120,53 @@ enum DriveParameter {
 
 struct DrivePlan {
     drive_id: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     parameter: DriveParameter,
     start_value: f32,
     end_value: f32,
     cycle_seconds: f32,
     playback: PlaybackTraversal,
+}
+
+#[derive(Clone)]
+struct ParticleState {
+    pos: Point2,
+    prev_pos: Point2,
+    fixed: bool,
+}
+
+struct LinkConstraint {
+    a: String,
+    b: String,
+    length: f32,
+}
+
+#[derive(Clone)]
+struct SliderConstraint {
+    joint_id: String,
+    axis_origin: Point2,
+    axis_dir: Vec2,
+    range: (f32, f32),
+}
+
+enum DriveConstraint {
+    Angular {
+        pivot_joint_id: String,
+        tip_joint_id: String,
+        angle: f32,
+        length: f32,
+    },
+    Linear {
+        joint_id: String,
+        axis_origin: Point2,
+        axis_dir: Vec2,
+        value: f32,
+    },
+}
+
+struct RelaxationResult {
+    particles: BTreeMap<String, ParticleState>,
+    max_constraint_error: f32,
 }
 
 struct SolvedAssembly {
@@ -128,23 +196,25 @@ struct SolvedPoi {
     position: Point2,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct AssemblySpec {
     joints: BTreeMap<String, JointSpec>,
     parts: BTreeMap<String, PartSpec>,
     drives: BTreeMap<String, DriveSpec>,
     points_of_interest: Vec<PointOfInterestSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visualization: Option<VisualizationSpec>,
     meta: AssemblyMeta,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 enum JointSpec {
     Fixed { position: [f32; 2] },
     Free,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 enum PartSpec {
     Link {
@@ -160,13 +230,13 @@ enum PartSpec {
     },
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct DriveSpec {
     kind: DriveKindSpec,
     sweep: SweepSpec,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 enum DriveKindSpec {
     Angular {
@@ -184,13 +254,13 @@ enum DriveKindSpec {
     },
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct SweepSpec {
     samples: u32,
-    direction: &'static str,
+    direction: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct PointOfInterestSpec {
     id: String,
     host: String,
@@ -198,14 +268,59 @@ struct PointOfInterestSpec {
     perp: f32,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+struct VisualizationSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_model: Option<TraceModelSpec>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+enum TraceModelSpec {
+    RollingPaper {
+        direction: PaperDirectionSpec,
+        advance_per_cycle: f32,
+    },
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+enum PaperDirectionSpec {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 struct AssemblyMeta {
     name: String,
     iteration: u32,
     notes: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct ProposeMutationsArgs {
+    reasoning: String,
+    mutations: Vec<StartupMutation>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op")]
+enum StartupMutation {
+    #[serde(rename = "add_joint")]
+    AddJoint { id: String, joint: JointSpec },
+    #[serde(rename = "add_part")]
+    AddPart { id: String, part: PartSpec },
+    #[serde(rename = "add_drive")]
+    AddDrive { id: String, drive: DriveSpec },
+    #[serde(rename = "add_poi")]
+    AddPoi { poi: PointOfInterestSpec },
+    #[serde(rename = "note")]
+    Note { text: String },
+}
+
 fn main() {
+    dotenvy::dotenv().ok();
     let config = Config::from_args();
     CONFIG
         .set(config)
@@ -260,7 +375,8 @@ fn model(app: &App) -> Model {
         .get()
         .expect("linkage config should be available before model()")
         .clone();
-    let fixtures = build_fixture_presentations().expect("failed to build fixture bank");
+    let (fixtures, startup_generation_rx) =
+        build_fixture_presentations().expect("failed to build fixture bank");
 
     let mut window = app
         .new_window()
@@ -281,7 +397,10 @@ fn model(app: &App) -> Model {
         selected_fixture: config.fixture_index.min(fixtures.len().saturating_sub(1)),
         fixtures,
         playback_phase: 0.0,
+        playback_progress: 0.0,
         playback_paused: false,
+        live_trace_cycle: 0,
+        live_trace_u: 0.0,
         active_artifact_turn: None,
         headless_capture_state: Cell::new(HeadlessCaptureState::Pending),
         headless_capture_result: Arc::new(AtomicU8::new(0)),
@@ -291,26 +410,97 @@ fn model(app: &App) -> Model {
             None
         },
         spec_scroll_px: 0.0,
+        startup_generation_rx,
+        trace_cycle_entities: Vec::new(),
+        emitted_trace_cycles: 0,
     }
 }
 
 fn update(app: &App, model: &mut Model, update: Update) {
-    if let Some((turn, reset_phase, cycle_seconds)) = current_artifact(model)
-        .map(|artifact| (artifact.turn, artifact.reset_phase, artifact.cycle_seconds))
+    if let Some(rx) = &model.startup_generation_rx {
+        if let Ok(result) = rx.try_recv() {
+            if !model.fixtures.is_empty() {
+                model.fixtures[0] = result.fixture;
+            }
+            model.startup_generation_rx = None;
+        }
+    }
+
+    if let Some((turn, reset_phase, cycle_seconds, playback)) =
+        current_artifact(model).map(|artifact| {
+            (
+                artifact.turn,
+                artifact.reset_phase,
+                artifact.cycle_seconds,
+                artifact.playback,
+            )
+        })
     {
         if model.active_artifact_turn != Some(turn) {
-            if reset_phase {
-                model.playback_phase = 0.0;
-            }
+            model.playback_progress = if reset_phase {
+                0.0
+            } else {
+                model.playback_progress.fract()
+            };
+            model.playback_phase = model.playback_progress;
+            model.live_trace_cycle = 0;
+            model.live_trace_u = 0.0;
             model.active_artifact_turn = Some(turn);
+            model.trace_cycle_entities.clear();
+            model.emitted_trace_cycles = 0;
         }
 
         if !model.playback_paused {
             let delta = update.since_last.as_secs_f32() / cycle_seconds.max(0.001);
-            model.playback_phase = (model.playback_phase + delta).rem_euclid(1.0);
+            model.playback_progress += delta;
+            model.playback_phase = model.playback_progress.rem_euclid(1.0);
+        }
+
+        (model.live_trace_cycle, model.live_trace_u) = update_live_trace_state(
+            model.playback_progress,
+            model.live_trace_cycle,
+            model.live_trace_u,
+            playback,
+        );
+
+        if let Some(artifact) = current_artifact(model).cloned() {
+            if rolling_paper_config(&artifact).is_some() {
+                let completed_cycles = model.playback_progress.floor().max(0.0) as u32;
+                while model.emitted_trace_cycles < completed_cycles {
+                    spawn_trace_cycle_entities(
+                        &mut model.trace_cycle_entities,
+                        &artifact,
+                        model.emitted_trace_cycles,
+                    );
+                    model.emitted_trace_cycles += 1;
+                }
+
+                let (_, render_rect) = content_rects(app.window_rect());
+                let local_rect = Rect::from_w_h(render_rect.w() - 28.0, render_rect.h() - 72.0);
+                let map = make_world_to_local(local_rect, artifact_bounds(&artifact));
+                let current_progress = model.playback_progress;
+                let render_offset = vec2(render_rect.x(), render_rect.y() - RENDER_VIEW_Y_OFFSET);
+                let window_rect = app.window_rect();
+                model.trace_cycle_entities.retain(|entity| {
+                    trace_cycle_entity_visible(
+                        entity,
+                        current_progress,
+                        &artifact,
+                        &map,
+                        render_offset,
+                        window_rect,
+                    )
+                });
+            }
         }
     } else {
         model.active_artifact_turn = None;
+        model.playback_progress = 0.0;
+        model.playback_phase = 0.0;
+        model.live_trace_cycle = 0;
+        model.live_trace_u = 0.0;
+        model.trace_cycle_entities.clear();
+        model.emitted_trace_cycles = 0;
     }
 
     if model.headless && model.headless_capture_state.get() == HeadlessCaptureState::Queued {
@@ -328,6 +518,11 @@ fn update(app: &App, model: &mut Model, update: Update) {
 }
 
 fn key_pressed(app: &App, model: &mut Model, key: Key) {
+    if let Some(index) = fixture_key_index(key) {
+        select_fixture(model, index);
+        return;
+    }
+
     match key {
         Key::S => {
             let path = model
@@ -337,9 +532,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             app.main_window().capture_frame(path);
         }
         Key::Space => model.playback_paused = !model.playback_paused,
-        Key::Key1 => select_fixture(model, 0),
-        Key::Key2 => select_fixture(model, 1),
-        Key::Key3 => select_fixture(model, 2),
         Key::Tab => select_fixture(model, (model.selected_fixture + 1) % model.fixtures.len()),
         Key::Up => scroll_spec(model, app.window_rect(), -PANE_LINE_H * 3.0),
         Key::Down => scroll_spec(model, app.window_rect(), PANE_LINE_H * 3.0),
@@ -358,6 +550,21 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             model.spec_scroll_px = max_spec_scroll_px(current_fixture(model), app.window_rect())
         }
         _ => {}
+    }
+}
+
+fn fixture_key_index(key: Key) -> Option<usize> {
+    match key {
+        Key::Key1 => Some(0),
+        Key::Key2 => Some(1),
+        Key::Key3 => Some(2),
+        Key::Key4 => Some(3),
+        Key::Key5 => Some(4),
+        Key::Key6 => Some(5),
+        Key::Key7 => Some(6),
+        Key::Key8 => Some(7),
+        Key::Key9 => Some(8),
+        _ => None,
     }
 }
 
@@ -383,7 +590,10 @@ fn view(app: &App, model: &Model, frame: Frame) {
     draw.background().color(BLACK);
     draw_scene(&draw, win, model);
 
-    if model.headless && model.headless_capture_state.get() == HeadlessCaptureState::Pending {
+    if model.headless
+        && model.headless_capture_state.get() == HeadlessCaptureState::Pending
+        && !matches!(current_fixture(model).status, FixtureStatus::Loading(_))
+    {
         if let Some(path) = &model.capture_path {
             app.main_window().capture_frame(path);
             let capture_path = path.clone();
@@ -424,26 +634,34 @@ fn current_fixture(model: &Model) -> &FixturePresentation {
 
 fn current_artifact(model: &Model) -> Option<&Arc<SweepArtifact>> {
     match &current_fixture(model).status {
+        FixtureStatus::Loading(_)
+        | FixtureStatus::GenerationError(_)
+        | FixtureStatus::ValidationError(_)
+        | FixtureStatus::RelaxationError(_) => None,
         FixtureStatus::Solved(artifact) => Some(artifact),
-        FixtureStatus::ValidationError(_) | FixtureStatus::SolverError(_) => None,
     }
 }
 
-fn build_fixture_presentations() -> Result<Vec<FixturePresentation>, String> {
+fn build_fixture_presentations() -> Result<
+    (
+        Vec<FixturePresentation>,
+        Option<Receiver<StartupGenerationResult>>,
+    ),
+    String,
+> {
+    let (startup_fixture, startup_generation_rx) = startup_fixture_slot();
     let fixtures = vec![
-        ("1 VALID", slider_crank_fixture()),
-        ("2 BAD REF", invalid_reference_fixture()),
-        ("3 UNSOLVED", unsolved_slider_crank_fixture()),
+        startup_fixture,
+        build_fixture_presentation("2 VALID", slider_crank_fixture())?,
+        build_fixture_presentation("3 BAD REF", invalid_reference_fixture())?,
+        build_fixture_presentation("4 UNSOLVED", unsolved_slider_crank_fixture())?,
     ];
 
-    fixtures
-        .into_iter()
-        .map(|(label, assembly)| build_fixture_presentation(label, assembly))
-        .collect()
+    Ok((fixtures, startup_generation_rx))
 }
 
 fn build_fixture_presentation(
-    label: &'static str,
+    label: &str,
     assembly: AssemblySpec,
 ) -> Result<FixturePresentation, String> {
     let json = serde_json::to_string_pretty(&assembly)
@@ -451,16 +669,88 @@ fn build_fixture_presentation(
     let status = match validate_fixture(&assembly) {
         Ok(()) => match build_sweep_artifact(assembly.clone(), 1) {
             Ok(artifact) => FixtureStatus::Solved(Arc::new(artifact)),
-            Err(err) => FixtureStatus::SolverError(err),
+            Err(err) => FixtureStatus::RelaxationError(err),
         },
         Err(err) => FixtureStatus::ValidationError(err),
     };
     let json_lines = json.lines().map(|line| line.to_string()).collect();
     Ok(FixturePresentation {
-        label,
+        label: label.to_string(),
         status,
         json_lines,
     })
+}
+
+fn startup_fixture_slot() -> (
+    FixturePresentation,
+    Option<Receiver<StartupGenerationResult>>,
+) {
+    let model_name = startup_model_name();
+    let placeholder_json = vec![
+        "{".to_string(),
+        format!("  \"startup_generation\": \"pending\","),
+        format!("  \"model\": \"{}\",", model_name),
+        "  \"source\": \"static startup prompt with embedded sample fixture\"".to_string(),
+        "}".to_string(),
+    ];
+
+    let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
+        return (
+            FixturePresentation {
+                label: "1 STARTUP".to_string(),
+                status: FixtureStatus::GenerationError(
+                    "OPENAI_API_KEY is missing; using local fixtures only".to_string(),
+                ),
+                json_lines: vec![
+                    "{".to_string(),
+                    "  \"startup_generation\": \"disabled\",".to_string(),
+                    format!("  \"model\": \"{}\",", model_name),
+                    "  \"reason\": \"OPENAI_API_KEY missing\"".to_string(),
+                    "}".to_string(),
+                ],
+            },
+            None,
+        );
+    };
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let fixture = match generate_startup_fixture(&api_key) {
+            Ok(assembly) => match build_fixture_presentation("1 STARTUP", assembly) {
+                Ok(presentation) => presentation,
+                Err(err) => generation_error_fixture("1 STARTUP", err),
+            },
+            Err(err) => generation_error_fixture("1 STARTUP", err),
+        };
+        let _ = tx.send(StartupGenerationResult { fixture });
+    });
+
+    (
+        FixturePresentation {
+            label: "1 STARTUP".to_string(),
+            status: FixtureStatus::Loading(format!(
+                "waiting for {} to generate a startup fixture",
+                model_name
+            )),
+            json_lines: placeholder_json,
+        },
+        Some(rx),
+    )
+}
+
+fn generation_error_fixture(label: &str, error: String) -> FixturePresentation {
+    let json_lines = vec![
+        "{".to_string(),
+        "  \"startup_generation\": \"failed\",".to_string(),
+        format!("  \"model\": \"{}\",", startup_model_name()),
+        format!("  \"error\": \"{}\"", error.replace('"', "\\\"")),
+        "}".to_string(),
+    ];
+    FixturePresentation {
+        label: label.to_string(),
+        status: FixtureStatus::GenerationError(error),
+        json_lines,
+    }
 }
 
 fn slider_crank_fixture() -> AssemblySpec {
@@ -513,7 +803,7 @@ fn slider_crank_fixture() -> AssemblySpec {
             },
             sweep: SweepSpec {
                 samples: 180,
-                direction: "Clockwise",
+                direction: "Clockwise".to_string(),
             },
         },
     );
@@ -528,10 +818,16 @@ fn slider_crank_fixture() -> AssemblySpec {
             t: 0.5,
             perp: 0.0,
         }],
+        visualization: Some(VisualizationSpec {
+            trace_model: Some(TraceModelSpec::RollingPaper {
+                direction: PaperDirectionSpec::Up,
+                advance_per_cycle: 180.0,
+            }),
+        }),
         meta: AssemblyMeta {
             name: "p1-slider-crank".to_string(),
             iteration: 1,
-            notes: vec!["P1 closed-form hard-coded fixture".to_string()],
+            notes: vec!["P1 deterministic relaxation fixture".to_string()],
         },
     }
 }
@@ -552,11 +848,15 @@ fn unsolved_slider_crank_fixture() -> AssemblySpec {
         *range = [500.0, 600.0];
     }
     assembly.meta.name = "p1-unsolved-slider-crank".to_string();
-    assembly.meta.notes = vec!["Intentional solver range failure".to_string()];
+    assembly.meta.notes = vec!["Intentional relaxation range failure".to_string()];
     assembly
 }
 
 fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
+    if assembly.drives.len() != 1 {
+        return Err("fixture must contain exactly one drive for the current renderer".to_string());
+    }
+
     for (part_id, part) in &assembly.parts {
         match part {
             PartSpec::Link { a, b, length } => {
@@ -584,7 +884,7 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
                 }
                 if axis_dir[0].abs() < 0.999 || axis_dir[1].abs() > 0.001 {
                     return Err(format!(
-                        "part {part_id}: P1 fixture renderer requires a horizontal slider axis"
+                        "part {part_id}: current relaxation engine requires a horizontal slider axis"
                     ));
                 }
                 if range[0] >= range[1] {
@@ -620,7 +920,7 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
                     }
                 }
                 if !matches!(
-                    drive.sweep.direction,
+                    drive.sweep.direction.as_str(),
                     "Clockwise" | "CW" | "Forward" | "CounterClockwise" | "CCW" | "Reverse"
                 ) {
                     return Err(format!(
@@ -664,166 +964,895 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
         }
     }
 
+    if let Some(VisualizationSpec {
+        trace_model:
+            Some(TraceModelSpec::RollingPaper {
+                advance_per_cycle, ..
+            }),
+    }) = &assembly.visualization
+    {
+        if !advance_per_cycle.is_finite() || *advance_per_cycle <= 0.0 {
+            return Err(
+                "visualization rolling paper advance_per_cycle must be positive".to_string(),
+            );
+        }
+    }
+
     Ok(())
 }
 
-fn solve_slider_crank_pose(assembly: &AssemblySpec, theta: f32) -> Result<SolvedAssembly, String> {
-    let pivot = match assembly.joints.get("j_pivot") {
-        Some(JointSpec::Fixed { position }) => pt2(position[0], position[1]),
-        _ => return Err("fixture missing fixed pivot".to_string()),
-    };
+fn generate_startup_fixture(api_key: &str) -> Result<AssemblySpec, String> {
+    let sample_fixture = serde_json::to_string_pretty(&startup_prompt_sample_fixture())
+        .map_err(|err| format!("failed to serialize sample fixture: {err}"))?;
+    let system_prompt = format!(
+        concat!(
+            "You generate one visually interesting linkage fixture for a startup visualization.\n",
+            "Current assembly is empty.\n",
+            "Call the propose_mutations tool exactly once. Do not emit JSON in prose.\n",
+            "Use add_* mutations to construct the full startup fixture in one batch.\n",
+            "For this cold start, 6-12 ops is acceptable.\n",
+            "Constraints:\n",
+            "- Exactly one slider-crank topology: one fixed pivot joint, one crank link, one coupler link, one slider track, one drive.\n",
+            "- Keep the slider axis horizontal and its range increasing.\n",
+            "- Use one angular drive.\n",
+            "- If the angular drive omits range, it must stay relaxable through a full rotation.\n",
+            "- Include 1 to 3 points_of_interest on links so traces are interesting.\n",
+            "- Keep points_of_interest on their host links with perp = 0.0 by default.\n",
+            "- Use perp != 0.0 only when the offset is materially important to the intended visual effect.\n",
+            "- Keep values finite and realistic for a small mechanism.\n",
+            "- Prefer an off-axis pivot so the crank is visibly above or below the slider track.\n",
+            "- Prefer small, coherent dimensions over extreme ranges.\n",
+            "Here is a valid sample fixture for reference. Do not copy its exact dimensions:\n",
+            "{}"
+        ),
+        sample_fixture
+    );
 
-    let crank_length = match assembly.parts.get("l_crank") {
-        Some(PartSpec::Link { length, .. }) => *length,
-        _ => return Err("fixture missing crank link".to_string()),
-    };
-    let coupler_length = match assembly.parts.get("l_coupler") {
-        Some(PartSpec::Link { length, .. }) => *length,
-        _ => return Err("fixture missing coupler link".to_string()),
-    };
-    let (axis_origin, slider_range) = match assembly.parts.get("s_track") {
-        Some(PartSpec::Slider {
+    let request_body = serde_json::json!({
+        "model": startup_model_name(),
+        "store": false,
+        "input": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": system_prompt
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Generate one startup linkage fixture now by calling propose_mutations."
+                    }
+                ]
+            }
+        ],
+        "tools": [
+            propose_mutations_tool_schema()
+        ],
+        "tool_choice": {
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "propose_mutations"
+                }
+            ]
+        }
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|err| format!("failed to build OpenAI client: {err}"))?;
+    let response = client
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&request_body)
+        .send()
+        .map_err(|err| format!("startup request failed: {err}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .map_err(|err| format!("failed to decode OpenAI response: {err}"))?;
+    if !status.is_success() {
+        let message = body
+            .get("error")
+            .and_then(|value| value.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown OpenAI error");
+        return Err(format!("OpenAI returned {}: {}", status.as_u16(), message));
+    }
+
+    let arguments =
+        extract_function_call_arguments(&body, "propose_mutations").ok_or_else(|| {
+            let fallback = extract_response_text(&body).unwrap_or_else(|| body.to_string());
+            format!(
+                "OpenAI did not return a propose_mutations tool call.\n{}",
+                trim_for_error(&fallback, 480)
+            )
+        })?;
+    let tool_args: ProposeMutationsArgs = serde_json::from_str(&arguments).map_err(|err| {
+        format!(
+            "failed to parse propose_mutations arguments: {err}\n{}",
+            trim_for_error(&arguments, 480)
+        )
+    })?;
+    build_startup_fixture_from_mutations(&tool_args)
+}
+
+fn startup_model_name() -> String {
+    std::env::var("OPENAI_MODEL").unwrap_or_else(|_| STARTUP_MODEL.to_string())
+}
+
+fn startup_prompt_sample_fixture() -> AssemblySpec {
+    let mut sample = slider_crank_fixture();
+    sample.visualization = None;
+    sample
+}
+
+fn propose_mutations_tool_schema() -> serde_json::Value {
+    serde_json::from_str(
+        r#"
+        {
+          "type": "function",
+          "name": "propose_mutations",
+          "description": "Propose one complete startup linkage as atomic mutations from an empty assembly. Use add_* operations to create the initial mechanism.",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "reasoning": { "type": "string" },
+              "mutations": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 12,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "op": {
+                      "type": "string",
+                      "enum": ["add_joint", "add_part", "add_drive", "add_poi", "note"]
+                    },
+                    "id": {
+                      "type": ["string", "null"]
+                    },
+                    "joint": {
+                      "type": ["object", "null"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "enum": ["Fixed", "Free"]
+                        },
+                        "position": {
+                          "type": ["array", "null"],
+                          "items": { "type": "number" },
+                          "minItems": 2,
+                          "maxItems": 2
+                        }
+                      },
+                      "required": ["type", "position"]
+                    },
+                    "part": {
+                      "type": ["object", "null"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "enum": ["Link", "Slider"]
+                        },
+                        "a": { "type": ["string", "null"] },
+                        "b": { "type": ["string", "null"] },
+                        "length": { "type": ["number", "null"] },
+                        "joint": { "type": ["string", "null"] },
+                        "axis_origin": {
+                          "type": ["array", "null"],
+                          "items": { "type": "number" },
+                          "minItems": 2,
+                          "maxItems": 2
+                        },
+                        "axis_dir": {
+                          "type": ["array", "null"],
+                          "items": { "type": "number" },
+                          "minItems": 2,
+                          "maxItems": 2
+                        },
+                        "range": {
+                          "type": ["array", "null"],
+                          "items": { "type": "number" },
+                          "minItems": 2,
+                          "maxItems": 2
+                        }
+                      },
+                      "required": ["type", "a", "b", "length", "joint", "axis_origin", "axis_dir", "range"]
+                    },
+                    "drive": {
+                      "type": ["object", "null"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "kind": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "enum": ["Angular"]
+                            },
+                            "pivot_joint": { "type": "string" },
+                            "tip_joint": { "type": "string" },
+                            "link": { "type": "string" },
+                            "range": {
+                              "type": ["array", "null"],
+                              "items": { "type": "number" },
+                              "minItems": 2,
+                              "maxItems": 2
+                            }
+                          },
+                          "required": ["type", "pivot_joint", "tip_joint", "link", "range"]
+                        },
+                        "sweep": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "properties": {
+                            "samples": { "type": "integer", "minimum": 2 },
+                            "direction": { "type": "string" }
+                          },
+                          "required": ["samples", "direction"]
+                        }
+                      },
+                      "required": ["kind", "sweep"]
+                    },
+                    "poi": {
+                      "type": ["object", "null"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "id": { "type": "string" },
+                        "host": { "type": "string" },
+                        "t": { "type": "number" },
+                        "perp": { "type": "number" }
+                      },
+                      "required": ["id", "host", "t", "perp"]
+                    },
+                    "text": {
+                      "type": ["string", "null"]
+                    }
+                  },
+                  "required": ["op", "id", "joint", "part", "drive", "poi", "text"]
+                }
+              }
+            },
+            "required": ["reasoning", "mutations"]
+          }
+        }
+        "#,
+    )
+    .expect("propose_mutations tool schema should be valid JSON")
+}
+
+fn extract_response_text(body: &serde_json::Value) -> Option<String> {
+    if let Some(text) = body.get("output_text").and_then(serde_json::Value::as_str) {
+        return Some(text.to_string());
+    }
+
+    body.get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find_map(|content| {
+            content
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+}
+
+fn extract_function_call_arguments(body: &serde_json::Value, tool_name: &str) -> Option<String> {
+    body.get("output")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                let item_type = item.get("type").and_then(serde_json::Value::as_str);
+                let item_name = item.get("name").and_then(serde_json::Value::as_str);
+                if item_type == Some("function_call") && item_name == Some(tool_name) {
+                    item.get("arguments")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn build_startup_fixture_from_mutations(
+    args: &ProposeMutationsArgs,
+) -> Result<AssemblySpec, String> {
+    let assembly = apply_startup_mutation_set(&args.reasoning, &args.mutations)
+        .map_err(|err| format!("mutation application failed: {err}"))?;
+    if let Err(err) = validate_fixture(&assembly) {
+        return Err(format!("validation failed: {err}"));
+    }
+    if let Err(err) = build_sweep_artifact(assembly.clone(), 1) {
+        return Err(format!("relaxation failed: {err}"));
+    }
+    Ok(assembly)
+}
+
+fn apply_startup_mutation_set(
+    reasoning: &str,
+    mutations: &[StartupMutation],
+) -> Result<AssemblySpec, String> {
+    let mut assembly = empty_startup_assembly();
+    if !reasoning.trim().is_empty() {
+        assembly
+            .meta
+            .notes
+            .push(format!("startup reasoning: {}", reasoning.trim()));
+    }
+
+    for mutation in mutations {
+        match mutation {
+            StartupMutation::AddJoint { id, joint } => {
+                if assembly.joints.contains_key(id) {
+                    return Err(format!("duplicate joint id {id}"));
+                }
+                assembly.joints.insert(id.clone(), joint.clone());
+            }
+            StartupMutation::AddPart { id, part } => {
+                if assembly.parts.contains_key(id) {
+                    return Err(format!("duplicate part id {id}"));
+                }
+                assembly.parts.insert(id.clone(), part.clone());
+            }
+            StartupMutation::AddDrive { id, drive } => {
+                if assembly.drives.contains_key(id) {
+                    return Err(format!("duplicate drive id {id}"));
+                }
+                assembly.drives.insert(id.clone(), drive.clone());
+            }
+            StartupMutation::AddPoi { poi } => {
+                if assembly
+                    .points_of_interest
+                    .iter()
+                    .any(|existing| existing.id == poi.id)
+                {
+                    return Err(format!("duplicate poi id {}", poi.id));
+                }
+                assembly.points_of_interest.push(poi.clone());
+            }
+            StartupMutation::Note { text } => {
+                if !text.trim().is_empty() {
+                    assembly.meta.notes.push(text.trim().to_string());
+                }
+            }
+        }
+    }
+
+    Ok(assembly)
+}
+
+fn empty_startup_assembly() -> AssemblySpec {
+    AssemblySpec {
+        joints: BTreeMap::new(),
+        parts: BTreeMap::new(),
+        drives: BTreeMap::new(),
+        points_of_interest: Vec::new(),
+        visualization: None,
+        meta: AssemblyMeta {
+            name: "startup-generated".to_string(),
+            iteration: 1,
+            notes: Vec::new(),
+        },
+    }
+}
+
+fn trim_for_error(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        text.to_string()
+    } else {
+        format!("{}...", text.chars().take(max_len).collect::<String>())
+    }
+}
+
+fn collect_link_constraints(assembly: &AssemblySpec) -> Result<Vec<LinkConstraint>, String> {
+    let mut links = Vec::new();
+    for (part_id, part) in &assembly.parts {
+        if let PartSpec::Link { a, b, length } = part {
+            if !assembly.joints.contains_key(a) || !assembly.joints.contains_key(b) {
+                return Err(format!("link {part_id} references missing joints"));
+            }
+            links.push(LinkConstraint {
+                a: a.clone(),
+                b: b.clone(),
+                length: *length,
+            });
+        }
+    }
+    Ok(links)
+}
+
+fn collect_slider_constraints(assembly: &AssemblySpec) -> Result<Vec<SliderConstraint>, String> {
+    let mut sliders = Vec::new();
+    for (part_id, part) in &assembly.parts {
+        if let PartSpec::Slider {
+            joint,
             axis_origin,
             axis_dir,
             range,
-            ..
-        }) => {
-            if axis_dir[0].abs() < 0.999 || axis_dir[1].abs() > 0.001 {
-                return Err("P1 fixture solver assumes a horizontal slider axis".to_string());
+        } = part
+        {
+            if !assembly.joints.contains_key(joint) {
+                return Err(format!("slider {part_id} references missing joint {joint}"));
             }
-            (pt2(axis_origin[0], axis_origin[1]), (range[0], range[1]))
+            let dir = vec2(axis_dir[0], axis_dir[1]);
+            if dir.length_squared() < 0.99 {
+                return Err(format!("slider {part_id} has a non-normalized axis"));
+            }
+            sliders.push(SliderConstraint {
+                joint_id: joint.clone(),
+                axis_origin: pt2(axis_origin[0], axis_origin[1]),
+                axis_dir: dir.normalize(),
+                range: (range[0], range[1]),
+            });
         }
-        _ => return Err("fixture missing slider track".to_string()),
-    };
-
-    let tip = pt2(
-        pivot.x + crank_length * theta.cos(),
-        pivot.y + crank_length * theta.sin(),
-    );
-    let dy = tip.y - axis_origin.y;
-    if dy.abs() > coupler_length {
-        return Err("coupler cannot reach slider axis at origin pose".to_string());
     }
-
-    let slider_offset = (coupler_length * coupler_length - dy * dy).sqrt();
-    let slider_x = tip.x + slider_offset;
-    if slider_x < slider_range.0 || slider_x > slider_range.1 {
-        return Err("origin pose places slider outside its allowed range".to_string());
-    }
-    let slide = pt2(slider_x, axis_origin.y);
-
-    let mut joints = BTreeMap::new();
-    joints.insert(
-        "j_pivot".to_string(),
-        SolvedJoint {
-            position: pivot,
-            fixed: true,
-        },
-    );
-    joints.insert(
-        "j_tip".to_string(),
-        SolvedJoint {
-            position: tip,
-            fixed: false,
-        },
-    );
-    joints.insert(
-        "j_slide".to_string(),
-        SolvedJoint {
-            position: slide,
-            fixed: false,
-        },
-    );
-    let poi_positions = solve_poi_positions(assembly, &joints)?;
-
-    Ok(SolvedAssembly {
-        joints,
-        links: vec![
-            SolvedLink {
-                a: "j_pivot".to_string(),
-                b: "j_tip".to_string(),
-            },
-            SolvedLink {
-                a: "j_tip".to_string(),
-                b: "j_slide".to_string(),
-            },
-        ],
-        slider: SolvedSlider {
-            start: pt2(slider_range.0, axis_origin.y),
-            end: pt2(slider_range.1, axis_origin.y),
-            joint: "j_slide".to_string(),
-        },
-        pois: poi_positions
-            .into_iter()
-            .map(|(_, position)| SolvedPoi { position })
-            .collect(),
-    })
+    Ok(sliders)
 }
 
-fn solve_slider_crank_from_slider(
+fn build_drive_constraint(
     assembly: &AssemblySpec,
-    slider_value: f32,
-) -> Result<SolvedAssembly, String> {
-    let pivot = match assembly.joints.get("j_pivot") {
-        Some(JointSpec::Fixed { position }) => pt2(position[0], position[1]),
-        _ => return Err("fixture missing fixed pivot".to_string()),
-    };
-    let crank_length = match assembly.parts.get("l_crank") {
-        Some(PartSpec::Link { length, .. }) => *length,
-        _ => return Err("fixture missing crank link".to_string()),
-    };
-    let coupler_length = match assembly.parts.get("l_coupler") {
-        Some(PartSpec::Link { length, .. }) => *length,
-        _ => return Err("fixture missing coupler link".to_string()),
-    };
-    let (axis_origin, axis_dir) = match assembly.parts.get("s_track") {
-        Some(PartSpec::Slider {
+    plan: &DrivePlan,
+    drive_value: f32,
+) -> Result<DriveConstraint, String> {
+    let drive = assembly
+        .drives
+        .get(&plan.drive_id)
+        .ok_or_else(|| format!("drive {} is missing", plan.drive_id))?;
+    match &drive.kind {
+        DriveKindSpec::Angular {
+            pivot_joint,
+            tip_joint,
+            link,
+            ..
+        } => {
+            let length = match assembly.parts.get(link) {
+                Some(PartSpec::Link { length, .. }) => *length,
+                _ => {
+                    return Err(format!(
+                        "drive {} references missing link {link}",
+                        plan.drive_id
+                    ));
+                }
+            };
+            Ok(DriveConstraint::Angular {
+                pivot_joint_id: pivot_joint.clone(),
+                tip_joint_id: tip_joint.clone(),
+                angle: drive_value,
+                length,
+            })
+        }
+        DriveKindSpec::Linear { slider, .. } => {
+            let slider = assembly
+                .parts
+                .get(slider)
+                .ok_or_else(|| format!("drive {} references missing slider", plan.drive_id))?;
+            let PartSpec::Slider {
+                joint,
+                axis_origin,
+                axis_dir,
+                ..
+            } = slider
+            else {
+                return Err(format!(
+                    "drive {} references a non-slider part",
+                    plan.drive_id
+                ));
+            };
+            Ok(DriveConstraint::Linear {
+                joint_id: joint.clone(),
+                axis_origin: pt2(axis_origin[0], axis_origin[1]),
+                axis_dir: vec2(axis_dir[0], axis_dir[1]).normalize(),
+                value: drive_value,
+            })
+        }
+    }
+}
+
+fn seed_particles(
+    assembly: &AssemblySpec,
+    links: &[LinkConstraint],
+    sliders: &[SliderConstraint],
+    drive_constraint: &DriveConstraint,
+) -> Result<BTreeMap<String, ParticleState>, String> {
+    let mut positions = BTreeMap::<String, Point2>::new();
+
+    for (joint_id, joint) in &assembly.joints {
+        if let JointSpec::Fixed { position } = joint {
+            positions.insert(joint_id.clone(), pt2(position[0], position[1]));
+        }
+    }
+
+    for slider in sliders {
+        let midpoint = (slider.range.0 + slider.range.1) * 0.5;
+        let slider_pos = slider.axis_origin + slider.axis_dir * midpoint;
+        positions
+            .entry(slider.joint_id.clone())
+            .or_insert(slider_pos);
+    }
+
+    match drive_constraint {
+        DriveConstraint::Angular {
+            pivot_joint_id,
+            tip_joint_id,
+            angle,
+            length,
+        } => {
+            let pivot = *positions
+                .get(pivot_joint_id)
+                .ok_or_else(|| format!("drive pivot {pivot_joint_id} is not seeded"))?;
+            positions.insert(
+                tip_joint_id.clone(),
+                pivot + vec2(angle.cos(), angle.sin()) * *length,
+            );
+        }
+        DriveConstraint::Linear {
+            joint_id,
             axis_origin,
             axis_dir,
-            ..
-        }) => {
-            if axis_dir[0].abs() < 0.999 || axis_dir[1].abs() > 0.001 {
-                return Err("P2 slider solver assumes a horizontal slider axis".to_string());
-            }
-            (
-                pt2(axis_origin[0], axis_origin[1]),
-                vec2(axis_dir[0], axis_dir[1]),
-            )
+            value,
+        } => {
+            positions.insert(joint_id.clone(), *axis_origin + *axis_dir * *value);
         }
-        _ => return Err("fixture missing slider track".to_string()),
-    };
-
-    let slide = pt2(
-        axis_origin.x + axis_dir.x * slider_value,
-        axis_origin.y + axis_dir.y * slider_value,
-    );
-    let delta = slide - pivot;
-    let distance = delta.length();
-    if distance > crank_length + coupler_length
-        || distance < (crank_length - coupler_length).abs()
-        || distance <= 0.000_1
-    {
-        return Err("slider position cannot be reached by the current link lengths".to_string());
     }
 
-    let a = (crank_length * crank_length - coupler_length * coupler_length + distance * distance)
-        / (2.0 * distance);
-    let h_sq = crank_length * crank_length - a * a;
-    if h_sq < 0.0 {
-        return Err("slider position leads to an imaginary crank intersection".to_string());
+    for _ in 0..(links.len() + assembly.joints.len()).max(1) {
+        let mut changed = false;
+        for link in links {
+            let a = positions.get(&link.a).copied();
+            let b = positions.get(&link.b).copied();
+            match (a, b) {
+                (Some(a_pos), None) => {
+                    positions.insert(
+                        link.b.clone(),
+                        a_pos + deterministic_seed_direction(&link.a, &link.b) * link.length,
+                    );
+                    changed = true;
+                }
+                (None, Some(b_pos)) => {
+                    positions.insert(
+                        link.a.clone(),
+                        b_pos - deterministic_seed_direction(&link.a, &link.b) * link.length,
+                    );
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            break;
+        }
     }
-    let mid = pivot + delta * (a / distance);
-    let perp = vec2(-delta.y / distance, delta.x / distance);
-    let h = h_sq.sqrt();
-    let candidate_a = mid + perp * h;
-    let candidate_b = mid - perp * h;
-    let tip = if candidate_a.y >= candidate_b.y {
-        candidate_a
-    } else {
-        candidate_b
-    };
-    let theta = (tip.y - pivot.y).atan2(tip.x - pivot.x);
-    solve_slider_crank_pose(assembly, theta)
+
+    for (index, joint_id) in assembly.joints.keys().enumerate() {
+        positions.entry(joint_id.clone()).or_insert_with(|| {
+            let dx = 24.0 + index as f32 * 18.0;
+            let dy = if index % 2 == 0 { 28.0 } else { -28.0 };
+            pt2(dx, dy)
+        });
+    }
+
+    Ok(assembly
+        .joints
+        .iter()
+        .map(|(joint_id, joint)| {
+            let pos = *positions
+                .get(joint_id)
+                .expect("every joint should have a seeded position");
+            (
+                joint_id.clone(),
+                ParticleState {
+                    pos,
+                    prev_pos: pos,
+                    fixed: matches!(joint, JointSpec::Fixed { .. }),
+                },
+            )
+        })
+        .collect())
+}
+
+fn deterministic_seed_direction(a: &str, b: &str) -> Vec2 {
+    let mut hash = 2166136261u32;
+    for byte in a.bytes().chain([b':']).chain(b.bytes()) {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    let angle = (hash % 8192) as f32 / 8192.0 * TAU;
+    vec2(angle.cos(), angle.sin()).normalize()
+}
+
+fn verlet_step(particles: &mut BTreeMap<String, ParticleState>) {
+    let accel = vec2(0.0, 0.0) * RELAXATION_DT * RELAXATION_DT;
+    for particle in particles.values_mut() {
+        if particle.fixed {
+            continue;
+        }
+        let current = particle.pos;
+        let velocity = (particle.pos - particle.prev_pos) * RELAXATION_DAMPING;
+        particle.pos += velocity + accel;
+        particle.prev_pos = current;
+    }
+}
+
+fn relax_particles(
+    assembly: &AssemblySpec,
+    initial_state: &BTreeMap<String, ParticleState>,
+    links: &[LinkConstraint],
+    sliders: &[SliderConstraint],
+    drive_constraint: &DriveConstraint,
+) -> Result<RelaxationResult, String> {
+    let mut particles = initial_state.clone();
+    verlet_step(&mut particles);
+
+    let mut max_constraint_error = f32::INFINITY;
+    for _ in 0..RELAXATION_ITERATIONS {
+        let mut max_correction = 0.0f32;
+        max_correction = max_correction.max(project_fixed_constraints(assembly, &mut particles));
+        max_correction =
+            max_correction.max(project_drive_constraint(drive_constraint, &mut particles));
+        max_correction = max_correction.max(project_slider_constraints(sliders, &mut particles));
+        max_correction = max_correction.max(project_link_constraints(links, &mut particles));
+        max_correction = max_correction.max(project_slider_constraints(sliders, &mut particles));
+        max_correction = max_correction.max(project_fixed_constraints(assembly, &mut particles));
+        max_correction =
+            max_correction.max(project_drive_constraint(drive_constraint, &mut particles));
+
+        if particles.values().any(|particle| {
+            !particle.pos.x.is_finite()
+                || !particle.pos.y.is_finite()
+                || particle.pos.x.abs() > RELAXATION_DIVERGENCE_LIMIT
+                || particle.pos.y.abs() > RELAXATION_DIVERGENCE_LIMIT
+        }) {
+            return Err("relaxation diverged".to_string());
+        }
+
+        max_constraint_error =
+            compute_max_constraint_error(assembly, &particles, links, sliders, drive_constraint);
+        if max_constraint_error <= RELAXATION_TOLERANCE && max_correction <= RELAXATION_TOLERANCE {
+            return Ok(RelaxationResult {
+                particles,
+                max_constraint_error,
+            });
+        }
+    }
+
+    Err(format!(
+        "relaxation failed to settle: max constraint error {:.3}",
+        max_constraint_error
+    ))
+}
+
+fn project_fixed_constraints(
+    assembly: &AssemblySpec,
+    particles: &mut BTreeMap<String, ParticleState>,
+) -> f32 {
+    let mut max_correction = 0.0;
+    for (joint_id, joint) in &assembly.joints {
+        if let JointSpec::Fixed { position } = joint {
+            let anchor = pt2(position[0], position[1]);
+            let particle = particles
+                .get_mut(joint_id)
+                .expect("fixed joint should have a particle");
+            max_correction = max_correction.max((anchor - particle.pos).length());
+            particle.pos = anchor;
+            particle.prev_pos = anchor;
+        }
+    }
+    max_correction
+}
+
+fn project_drive_constraint(
+    drive_constraint: &DriveConstraint,
+    particles: &mut BTreeMap<String, ParticleState>,
+) -> f32 {
+    match drive_constraint {
+        DriveConstraint::Angular {
+            pivot_joint_id,
+            tip_joint_id,
+            angle,
+            length,
+        } => {
+            let pivot = particles
+                .get(pivot_joint_id)
+                .map(|particle| particle.pos)
+                .expect("drive pivot should exist");
+            let target = pivot + vec2(angle.cos(), angle.sin()) * *length;
+            let tip = particles
+                .get_mut(tip_joint_id)
+                .expect("drive tip should exist");
+            let correction = (target - tip.pos).length();
+            tip.pos = target;
+            tip.prev_pos = target;
+            correction
+        }
+        DriveConstraint::Linear {
+            joint_id,
+            axis_origin,
+            axis_dir,
+            value,
+        } => {
+            let target = *axis_origin + *axis_dir * *value;
+            let joint = particles
+                .get_mut(joint_id)
+                .expect("driven slider joint should exist");
+            let correction = (target - joint.pos).length();
+            joint.pos = target;
+            joint.prev_pos = target;
+            correction
+        }
+    }
+}
+
+fn project_slider_constraints(
+    sliders: &[SliderConstraint],
+    particles: &mut BTreeMap<String, ParticleState>,
+) -> f32 {
+    let mut max_correction = 0.0;
+    for slider in sliders {
+        let particle = particles
+            .get_mut(&slider.joint_id)
+            .expect("slider joint should exist");
+        let rel = particle.pos - slider.axis_origin;
+        let scalar = rel.dot(slider.axis_dir);
+        let clamped = scalar.clamp(slider.range.0, slider.range.1);
+        let target = slider.axis_origin + slider.axis_dir * clamped;
+        max_correction = max_correction.max((target - particle.pos).length());
+        particle.pos = target;
+    }
+    max_correction
+}
+
+fn project_link_constraints(
+    links: &[LinkConstraint],
+    particles: &mut BTreeMap<String, ParticleState>,
+) -> f32 {
+    let mut max_correction = 0.0;
+    for link in links {
+        let a_particle = particles
+            .get(&link.a)
+            .expect("link endpoint should exist")
+            .clone();
+        let b_particle = particles
+            .get(&link.b)
+            .expect("link endpoint should exist")
+            .clone();
+        let delta = b_particle.pos - a_particle.pos;
+        let distance = delta.length();
+        let dir = if distance > 0.000_1 {
+            delta / distance
+        } else {
+            deterministic_seed_direction(&link.a, &link.b)
+        };
+        let error = distance - link.length;
+        let correction = dir * error;
+
+        match (a_particle.fixed, b_particle.fixed) {
+            (false, false) => {
+                if let Some(a) = particles.get_mut(&link.a) {
+                    a.pos += correction * 0.5;
+                }
+                if let Some(b) = particles.get_mut(&link.b) {
+                    b.pos -= correction * 0.5;
+                }
+                max_correction = max_correction.max(correction.length() * 0.5);
+            }
+            (true, false) => {
+                if let Some(b) = particles.get_mut(&link.b) {
+                    b.pos -= correction;
+                }
+                max_correction = max_correction.max(correction.length());
+            }
+            (false, true) => {
+                if let Some(a) = particles.get_mut(&link.a) {
+                    a.pos += correction;
+                }
+                max_correction = max_correction.max(correction.length());
+            }
+            (true, true) => {}
+        }
+    }
+    max_correction
+}
+
+fn compute_max_constraint_error(
+    assembly: &AssemblySpec,
+    particles: &BTreeMap<String, ParticleState>,
+    links: &[LinkConstraint],
+    sliders: &[SliderConstraint],
+    drive_constraint: &DriveConstraint,
+) -> f32 {
+    let mut max_error = 0.0f32;
+
+    for (joint_id, joint) in &assembly.joints {
+        if let JointSpec::Fixed { position } = joint {
+            let anchor = pt2(position[0], position[1]);
+            let particle = particles
+                .get(joint_id)
+                .expect("fixed joint should have a particle");
+            max_error = max_error.max((particle.pos - anchor).length());
+        }
+    }
+
+    for link in links {
+        let a = particles
+            .get(&link.a)
+            .expect("link endpoint should exist")
+            .pos;
+        let b = particles
+            .get(&link.b)
+            .expect("link endpoint should exist")
+            .pos;
+        max_error = max_error.max(((b - a).length() - link.length).abs());
+    }
+
+    for slider in sliders {
+        let particle = particles
+            .get(&slider.joint_id)
+            .expect("slider joint should exist");
+        let rel = particle.pos - slider.axis_origin;
+        let scalar = rel.dot(slider.axis_dir);
+        let clamped = scalar.clamp(slider.range.0, slider.range.1);
+        let target = slider.axis_origin + slider.axis_dir * clamped;
+        max_error = max_error.max((particle.pos - target).length());
+    }
+
+    max_error = max_error.max(match drive_constraint {
+        DriveConstraint::Angular {
+            pivot_joint_id,
+            tip_joint_id,
+            angle,
+            length,
+        } => {
+            let pivot = particles
+                .get(pivot_joint_id)
+                .expect("drive pivot should exist")
+                .pos;
+            let tip = particles
+                .get(tip_joint_id)
+                .expect("drive tip should exist")
+                .pos;
+            let target = pivot + vec2(angle.cos(), angle.sin()) * *length;
+            (tip - target).length()
+        }
+        DriveConstraint::Linear {
+            joint_id,
+            axis_origin,
+            axis_dir,
+            value,
+        } => {
+            let joint = particles
+                .get(joint_id)
+                .expect("driven slider joint should exist")
+                .pos;
+            let target = *axis_origin + *axis_dir * *value;
+            (joint - target).length()
+        }
+    });
+
+    max_error
 }
 
 fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifact, String> {
@@ -831,7 +1860,13 @@ fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifa
         return Err("fixture missing drive".to_string());
     };
     let plan = drive_plan(&assembly, drive_id, drive)?;
+    let links = collect_link_constraints(&assembly)?;
+    let sliders = collect_slider_constraints(&assembly)?;
     let samples = drive.sweep.samples.max(2) as usize;
+
+    let first_drive_value = sample_drive_value(&plan, 0.0);
+    let first_drive_constraint = build_drive_constraint(&assembly, &plan, first_drive_value)?;
+    let mut particle_state = seed_particles(&assembly, &links, &sliders, &first_drive_constraint)?;
 
     let mut frames = Vec::with_capacity(samples);
     let mut point_paths: BTreeMap<String, Vec<Point2>> = BTreeMap::new();
@@ -840,13 +1875,21 @@ fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifa
         let denom = (samples - 1).max(1) as f32;
         let base_u = sample_idx as f32 / denom;
         let drive_value = sample_drive_value(&plan, base_u);
-        let solved = match plan.parameter {
-            DriveParameter::Angle => solve_slider_crank_pose(&assembly, drive_value)?,
-            DriveParameter::SliderPosition => {
-                solve_slider_crank_from_slider(&assembly, drive_value)?
-            }
-        };
-        let poi_positions = solve_poi_positions(&assembly, &solved.joints)?;
+        let drive_constraint = build_drive_constraint(&assembly, &plan, drive_value)?;
+        let relaxed = relax_particles(
+            &assembly,
+            &particle_state,
+            &links,
+            &sliders,
+            &drive_constraint,
+        )?;
+        particle_state = relaxed.particles;
+
+        let joint_positions: BTreeMap<String, Point2> = particle_state
+            .iter()
+            .map(|(joint_id, particle)| (joint_id.clone(), particle.pos))
+            .collect();
+        let poi_positions = solve_poi_positions(&assembly, &joint_positions)?;
         for (poi_id, position) in &poi_positions {
             point_paths
                 .entry(poi_id.clone())
@@ -856,14 +1899,14 @@ fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifa
 
         frames.push(SolvedFrame {
             u: base_u,
-            joint_positions: solved
-                .joints
-                .iter()
-                .map(|(joint_id, joint)| (joint_id.clone(), joint.position))
-                .collect(),
+            joint_positions,
             drive_values: BTreeMap::from([(plan.drive_id.clone(), drive_value)]),
             poi_positions,
         });
+
+        if !relaxed.max_constraint_error.is_finite() {
+            return Err("relaxation diverged".to_string());
+        }
     }
 
     Ok(SweepArtifact {
@@ -879,7 +1922,7 @@ fn build_sweep_artifact(assembly: AssemblySpec, turn: u32) -> Result<SweepArtifa
 
 fn solve_poi_positions(
     assembly: &AssemblySpec,
-    joints: &BTreeMap<String, SolvedJoint>,
+    joint_positions: &BTreeMap<String, Point2>,
 ) -> Result<BTreeMap<String, Point2>, String> {
     let mut positions = BTreeMap::new();
     for poi in &assembly.points_of_interest {
@@ -889,21 +1932,19 @@ fn solve_poi_positions(
         let PartSpec::Link { a, b, .. } = host_part else {
             return Err(format!("poi {}: host {} is not a link", poi.id, poi.host));
         };
-        let Some(a_joint) = joints.get(a) else {
+        let Some(a_pos) = joint_positions.get(a) else {
             return Err(format!("poi {}: missing host joint {}", poi.id, a));
         };
-        let Some(b_joint) = joints.get(b) else {
+        let Some(b_pos) = joint_positions.get(b) else {
             return Err(format!("poi {}: missing host joint {}", poi.id, b));
         };
-        let a_pos = a_joint.position;
-        let b_pos = b_joint.position;
-        let along = b_pos - a_pos;
+        let along = *b_pos - *a_pos;
         let normal = if along.length_squared() > 0.0 {
             vec2(-along.y, along.x).normalize()
         } else {
             vec2(0.0, 0.0)
         };
-        let pos = a_pos + along * poi.t + normal * poi.perp;
+        let pos = *a_pos + along * poi.t + normal * poi.perp;
         positions.insert(poi.id.clone(), pos);
     }
     Ok(positions)
@@ -916,7 +1957,7 @@ fn drive_plan(
 ) -> Result<DrivePlan, String> {
     match &drive.kind {
         DriveKindSpec::Angular { range, .. } => {
-            let direction = drive.sweep.direction;
+            let direction = drive.sweep.direction.as_str();
             let (start_value, end_value, playback) = match range {
                 Some([start, end]) => {
                     if matches!(direction, "CounterClockwise" | "CCW" | "Reverse") {
@@ -972,6 +2013,21 @@ fn sample_drive_value(plan: &DrivePlan, u: f32) -> f32 {
 
 fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
     let fixture = current_fixture(model);
+    let render_phase = if model.headless {
+        1.0
+    } else {
+        model.playback_phase
+    };
+    let render_progress = if model.headless {
+        1.0
+    } else {
+        model.playback_progress
+    };
+    let live_trace_u = if model.headless {
+        1.0
+    } else {
+        model.live_trace_u
+    };
     draw_menu_layer(
         draw,
         win,
@@ -985,8 +2041,11 @@ fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
         draw,
         render_rect,
         fixture,
-        model.playback_phase,
+        render_phase,
+        render_progress,
+        live_trace_u,
         model.playback_paused,
+        &model.trace_cycle_entities,
     );
 }
 
@@ -1009,21 +2068,21 @@ fn draw_menu_layer(
         .color(rgba(1.0, 1.0, 1.0, 0.82));
 
     let mode_label = if headless {
-        "HEADLESS P2"
+        "HEADLESS P3"
     } else {
-        "PLAYBACK P2"
+        "PLAYBACK P3"
     };
     draw.text(mode_label)
         .x_y(win.right() - 78.0, win.top() - 24.0)
         .font_size(9)
         .color(rgba(1.0, 1.0, 1.0, 0.68));
 
-    let start_x = win.left() + 230.0;
-    let step = 86.0;
+    let start_x = win.left() + 220.0;
+    let step = 94.0;
     let indicator_y = win.top() - 36.0;
     for (index, fixture) in fixtures.iter().enumerate() {
         let x = start_x + index as f32 * step;
-        draw.text(fixture.label)
+        draw.text(&fixture.label)
             .x_y(x, win.top() - 24.0)
             .font_size(8)
             .color(if index == selected_fixture {
@@ -1105,15 +2164,20 @@ fn draw_render_pane(
     rect: Rect,
     fixture: &FixturePresentation,
     playback_phase: f32,
+    playback_progress: f32,
+    live_trace_u: f32,
     playback_paused: bool,
+    trace_cycle_entities: &[TraceCycleEntity],
 ) {
     let text_w = rect.w() - PANE_TEXT_INSET * 2.0;
     let text_x = rect.left() + PANE_TEXT_INSET + text_w * 0.5;
 
     let title = match fixture.status {
+        FixtureStatus::Loading(_) => "STARTUP GENERATION",
         FixtureStatus::Solved(_) => "SWEEP PLAYBACK",
         FixtureStatus::ValidationError(_) => "VALIDATION FAILURE",
-        FixtureStatus::SolverError(_) => "SOLVER FAILURE",
+        FixtureStatus::RelaxationError(_) => "RELAXATION FAILURE",
+        FixtureStatus::GenerationError(_) => "GENERATION FAILURE",
     };
     draw.text(title)
         .x_y(text_x, rect.top() - 18.0)
@@ -1123,6 +2187,7 @@ fn draw_render_pane(
         .left_justify();
 
     let subtitle = match fixture.status {
+        FixtureStatus::Loading(_) => "render loop stays live while the request runs",
         FixtureStatus::Solved(_) => {
             if playback_paused {
                 "space resumes playback"
@@ -1131,7 +2196,10 @@ fn draw_render_pane(
             }
         }
         FixtureStatus::ValidationError(_) => "validator rejected the selected fixture",
-        FixtureStatus::SolverError(_) => "solver could not produce a static origin pose",
+        FixtureStatus::RelaxationError(_) => "constraint relaxation did not settle",
+        FixtureStatus::GenerationError(_) => {
+            "startup request failed; local fixtures remain available"
+        }
     };
     draw.text(subtitle)
         .x_y(text_x, rect.top() - 34.0)
@@ -1143,6 +2211,9 @@ fn draw_render_pane(
     let local_draw = draw.x_y(rect.x(), rect.y() - RENDER_VIEW_Y_OFFSET);
     let local_rect = Rect::from_w_h(rect.w() - 28.0, rect.h() - 72.0);
     match &fixture.status {
+        FixtureStatus::Loading(message) => {
+            draw_error_state(&local_draw, local_rect, "OPENAI", message);
+        }
         FixtureStatus::Solved(artifact) => {
             draw_grid_local(&local_draw, local_rect);
             let sampled_u = playback_sample_u(playback_phase, artifact.playback);
@@ -1150,7 +2221,14 @@ fn draw_render_pane(
             let solved = solved_assembly_for_frame(&artifact.assembly, frame);
             let bounds = artifact_bounds(artifact);
             let map = make_world_to_local(local_rect, bounds);
-            draw_poi_traces_local(&local_draw, artifact, &map);
+            draw_trace_cycle_entities_local(
+                &local_draw,
+                trace_cycle_entities,
+                artifact,
+                playback_progress,
+                &map,
+            );
+            draw_poi_traces_local(&local_draw, artifact, live_trace_u, &map);
             draw_solution_local(&local_draw, local_rect, &solved, &map);
             let drive_status = frame
                 .drive_values
@@ -1182,8 +2260,11 @@ fn draw_render_pane(
         FixtureStatus::ValidationError(message) => {
             draw_error_state(&local_draw, local_rect, "VALIDATOR", message);
         }
-        FixtureStatus::SolverError(message) => {
-            draw_error_state(&local_draw, local_rect, "SOLVER", message);
+        FixtureStatus::RelaxationError(message) => {
+            draw_error_state(&local_draw, local_rect, "RELAX", message);
+        }
+        FixtureStatus::GenerationError(message) => {
+            draw_error_state(&local_draw, local_rect, "OPENAI", message);
         }
     }
 }
@@ -1425,6 +2506,18 @@ fn artifact_bounds(artifact: &SweepArtifact) -> Rect {
             max_x = max_x.max(position.x);
             min_y = min_y.min(position.y);
             max_y = max_y.max(position.y);
+
+            if let Some((direction, advance_per_cycle)) = rolling_paper_config(artifact) {
+                // Reserve one cycle of paper travel so enabling rolling paper does not
+                // immediately squeeze the mechanism framing. Additional completed cycles
+                // are expected to scroll out of view rather than expanding the camera.
+                let offset = direction * advance_per_cycle;
+                let rolled = *position + offset;
+                min_x = min_x.min(rolled.x);
+                max_x = max_x.max(rolled.x);
+                min_y = min_y.min(rolled.y);
+                max_y = max_y.max(rolled.y);
+            }
         }
     }
 
@@ -1475,17 +2568,51 @@ fn make_world_to_local(rect: Rect, bounds: Rect) -> impl Fn(Point2) -> Point2 {
     }
 }
 
-fn draw_poi_traces_local<F>(draw: &Draw, artifact: &SweepArtifact, map: &F)
+fn draw_poi_traces_local<F>(draw: &Draw, artifact: &SweepArtifact, current_u: f32, map: &F)
 where
     F: Fn(Point2) -> Point2,
 {
-    for (index, path) in artifact.telemetry.point_paths.values().enumerate() {
+    // `mark_u` is the static sample position recorded during the sweep. `current_u`
+    // is the live trace head within the current playback cycle after traversal mapping.
+    // Rolling paper offsets live samples by the distance between those two values.
+    let rolling = rolling_paper_config(artifact);
+    for (index, (_poi_id, path)) in artifact.telemetry.point_paths.iter().enumerate() {
         for (point_index, window) in path.windows(2).enumerate() {
             if point_index % 2 == 1 {
                 continue;
             }
-            let a = map(window[0]);
-            let b = map(window[1]);
+            let len = path.len().max(2);
+            let denom = (len - 1) as f32;
+            let u_a = point_index as f32 / denom;
+            let u_b = (point_index + 1) as f32 / denom;
+
+            let (a_world, b_world) = if let Some((direction, advance_per_cycle)) = rolling {
+                if current_u <= u_a {
+                    continue;
+                }
+
+                let a =
+                    rolling_paper_position(window[0], direction, advance_per_cycle, current_u, u_a);
+                if current_u >= u_b {
+                    let b = rolling_paper_position(
+                        window[1],
+                        direction,
+                        advance_per_cycle,
+                        current_u,
+                        u_b,
+                    );
+                    (a, b)
+                } else {
+                    let t = ((current_u - u_a) / (u_b - u_a).max(0.000_1)).clamp(0.0, 1.0);
+                    let point_now = window[0].lerp(window[1], t);
+                    (a, point_now)
+                }
+            } else {
+                (window[0], window[1])
+            };
+
+            let a = map(a_world);
+            let b = map(b_world);
             draw.line()
                 .start(a)
                 .end(b)
@@ -1493,6 +2620,158 @@ where
                 .color(poi_color(index, 0.72));
         }
     }
+}
+
+fn draw_trace_cycle_entities_local<F>(
+    draw: &Draw,
+    entities: &[TraceCycleEntity],
+    artifact: &SweepArtifact,
+    current_progress: f32,
+    map: &F,
+) where
+    F: Fn(Point2) -> Point2,
+{
+    let Some((direction, advance_per_cycle)) = rolling_paper_config(artifact) else {
+        return;
+    };
+
+    for entity in entities {
+        let translation = direction
+            * (advance_per_cycle * (current_progress - entity.completion_progress).max(0.0));
+        for (point_index, window) in entity.points.windows(2).enumerate() {
+            if point_index % 2 == 1 {
+                continue;
+            }
+            let a = map(window[0] + translation);
+            let b = map(window[1] + translation);
+            draw.line()
+                .start(a)
+                .end(b)
+                .weight(1.0)
+                .color(poi_color(entity.color_index, 0.72));
+        }
+    }
+}
+
+fn spawn_trace_cycle_entities(
+    entities: &mut Vec<TraceCycleEntity>,
+    artifact: &SweepArtifact,
+    cycle_index: u32,
+) {
+    let Some((direction, advance_per_cycle)) = rolling_paper_config(artifact) else {
+        return;
+    };
+
+    for (color_index, path) in artifact.telemetry.point_paths.values().enumerate() {
+        if path.len() < 2 {
+            continue;
+        }
+        let denom = (path.len() - 1) as f32;
+        let points = path
+            .iter()
+            .enumerate()
+            .map(|(point_index, point)| {
+                let u = point_index as f32 / denom;
+                rolling_paper_position(*point, direction, advance_per_cycle, 1.0, u)
+            })
+            .collect();
+        entities.push(TraceCycleEntity {
+            completion_progress: cycle_index as f32 + 1.0,
+            color_index,
+            points,
+        });
+    }
+
+    if entities.len() > MAX_TRACE_CYCLE_ENTITIES {
+        let excess = entities.len() - MAX_TRACE_CYCLE_ENTITIES;
+        entities.drain(..excess);
+    }
+}
+
+fn trace_cycle_entity_visible<F>(
+    entity: &TraceCycleEntity,
+    current_progress: f32,
+    artifact: &SweepArtifact,
+    map: &F,
+    render_offset: Vec2,
+    window_rect: Rect,
+) -> bool
+where
+    F: Fn(Point2) -> Point2,
+{
+    let Some((direction, advance_per_cycle)) = rolling_paper_config(artifact) else {
+        return false;
+    };
+    let translation =
+        direction * (advance_per_cycle * (current_progress - entity.completion_progress).max(0.0));
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for point in &entity.points {
+        let mapped = map(*point + translation) + render_offset;
+        min_x = min_x.min(mapped.x);
+        max_x = max_x.max(mapped.x);
+        min_y = min_y.min(mapped.y);
+        max_y = max_y.max(mapped.y);
+    }
+
+    !(max_x < window_rect.left()
+        || min_x > window_rect.right()
+        || max_y < window_rect.bottom()
+        || min_y > window_rect.top())
+}
+
+fn rolling_paper_config(artifact: &SweepArtifact) -> Option<(Vec2, f32)> {
+    match artifact
+        .assembly
+        .visualization
+        .as_ref()
+        .and_then(|visualization| visualization.trace_model.as_ref())
+    {
+        Some(TraceModelSpec::RollingPaper {
+            direction,
+            advance_per_cycle,
+        }) => Some((rolling_paper_direction(direction), *advance_per_cycle)),
+        _ => None,
+    }
+}
+
+fn rolling_paper_position(
+    point: Point2,
+    direction: Vec2,
+    advance_per_cycle: f32,
+    current_u: f32,
+    mark_u: f32,
+) -> Point2 {
+    point + direction * (advance_per_cycle * (current_u - mark_u).max(0.0))
+}
+
+fn rolling_paper_direction(direction: &PaperDirectionSpec) -> Vec2 {
+    match direction {
+        PaperDirectionSpec::Up => vec2(0.0, 1.0),
+        PaperDirectionSpec::Down => vec2(0.0, -1.0),
+        PaperDirectionSpec::Left => vec2(-1.0, 0.0),
+        PaperDirectionSpec::Right => vec2(1.0, 0.0),
+    }
+}
+
+fn update_live_trace_state(
+    playback_progress: f32,
+    previous_cycle: u32,
+    previous_max_u: f32,
+    traversal: PlaybackTraversal,
+) -> (u32, f32) {
+    let cycle = playback_progress.floor().max(0.0) as u32;
+    let phase = playback_progress.rem_euclid(1.0);
+    let current_u = playback_sample_u(phase, traversal);
+    let max_u = if cycle == previous_cycle {
+        previous_max_u.max(current_u)
+    } else {
+        current_u
+    };
+    (cycle, max_u)
 }
 
 fn poi_color(index: usize, alpha: f32) -> LinSrgba {
@@ -1636,7 +2915,7 @@ mod tests {
                 },
                 sweep: SweepSpec {
                     samples: 48,
-                    direction: "Forward",
+                    direction: "Forward".to_string(),
                 },
             },
         );
@@ -1649,6 +2928,84 @@ mod tests {
         assert_eq!(plan.start_value.to_bits(), (-20.0f32).to_bits());
         assert_eq!(plan.end_value.to_bits(), 180.0f32.to_bits());
         assert_eq!(plan.cycle_seconds.to_bits(), 1.5f32.to_bits());
+    }
+
+    #[test]
+    fn rolling_paper_trace_advances_upward_over_the_cycle() {
+        let artifact = build_sweep_artifact(slider_crank_fixture(), 1).expect("artifact");
+        let path = artifact
+            .telemetry
+            .point_paths
+            .get("poi_coupler_mid")
+            .expect("poi path");
+        let (direction, advance_per_cycle) =
+            rolling_paper_config(&artifact).expect("rolling paper");
+        let start = rolling_paper_position(path[0], direction, advance_per_cycle, 0.0, 0.0);
+        let end =
+            rolling_paper_position(path[path.len() - 1], direction, advance_per_cycle, 1.0, 0.0);
+        assert!(end.y > start.y + 100.0);
+    }
+
+    #[test]
+    fn unsolved_fixture_fails_relaxation() {
+        match build_sweep_artifact(unsolved_slider_crank_fixture(), 1) {
+            Ok(_) => panic!("fixture should fail"),
+            Err(err) => assert!(err.contains("relaxation")),
+        }
+    }
+
+    #[test]
+    fn rolling_paper_direction_maps_all_variants() {
+        assert_eq!(
+            rolling_paper_direction(&PaperDirectionSpec::Up),
+            vec2(0.0, 1.0)
+        );
+        assert_eq!(
+            rolling_paper_direction(&PaperDirectionSpec::Down),
+            vec2(0.0, -1.0)
+        );
+        assert_eq!(
+            rolling_paper_direction(&PaperDirectionSpec::Left),
+            vec2(-1.0, 0.0)
+        );
+        assert_eq!(
+            rolling_paper_direction(&PaperDirectionSpec::Right),
+            vec2(1.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn rolling_paper_ping_pong_trace_head_does_not_shrink_within_a_cycle() {
+        let (cycle, head_u) = update_live_trace_state(0.25, 0, 0.0, PlaybackTraversal::PingPong);
+        assert_eq!(cycle, 0);
+        assert!(head_u > 0.49 && head_u < 0.51);
+
+        let (_, peak_u) = update_live_trace_state(0.50, cycle, head_u, PlaybackTraversal::PingPong);
+        assert!(peak_u > 0.99);
+
+        let (_, return_u) =
+            update_live_trace_state(0.75, cycle, peak_u, PlaybackTraversal::PingPong);
+        assert_eq!(return_u.to_bits(), peak_u.to_bits());
+
+        let (next_cycle, reset_u) =
+            update_live_trace_state(1.10, cycle, return_u, PlaybackTraversal::PingPong);
+        assert_eq!(next_cycle, 1);
+        assert!(reset_u < 0.10);
+    }
+
+    #[test]
+    fn trace_cycle_entities_are_capped() {
+        let artifact = build_sweep_artifact(slider_crank_fixture(), 1).expect("artifact");
+        let mut entities = Vec::new();
+        for cycle_index in 0..(MAX_TRACE_CYCLE_ENTITIES as u32 + 32) {
+            spawn_trace_cycle_entities(&mut entities, &artifact, cycle_index);
+        }
+        assert_eq!(entities.len(), MAX_TRACE_CYCLE_ENTITIES);
+        assert_eq!(entities[0].completion_progress, 33.0);
+        assert_eq!(
+            entities[entities.len() - 1].completion_progress,
+            (MAX_TRACE_CYCLE_ENTITIES as u32 + 32) as f32
+        );
     }
 
     fn frame_signature(frames: &[SolvedFrame]) -> Vec<u32> {

@@ -8,7 +8,7 @@
 
 ## 1. Vision
 
-Linkage is an explorative mechanical design tool in which an LLM acts as co-designer. The user states intent in natural language ("a straight-line linkage", "a compact crank-slider", "a pantograph that scales 3x"), and the system iteratively constructs, solves, sweeps, and refines planar mechanisms — rendered in real time via Nannou. The LLM does not generate once; it enters a **critique → mutate → sweep → observe → refine** loop, consuming swept telemetry and proposing incremental mutations.
+Linkage is an explorative mechanical design tool in which an LLM acts as co-designer. The user states intent in natural language ("a straight-line linkage", "a compact crank-slider", "a pantograph that scales 3x"), and the system iteratively constructs, simulates, sweeps, and refines planar mechanisms — rendered in real time via Nannou. The LLM does not generate once; it enters a **critique → mutate → sweep → observe → refine** loop, consuming swept telemetry and proposing incremental mutations.
 
 ---
 
@@ -17,17 +17,17 @@ Linkage is an explorative mechanical design tool in which an LLM acts as co-desi
 Scoping up front so neither the user, the LLM, nor future-me wander:
 
 - **Not a CAD tool.** No dimensioning, drafting, tolerancing, STEP export.
-- **Not a dynamics engine.** No masses, forces, friction, energy. Kinematics only: positions, angles, paths.
+- **Not a full physics sandbox.** MVP uses a Verlet-based constraint integrator to reach plausible constrained poses and traces, but it is not aiming at physically accurate forces, impacts, or material simulation yet.
 - **Not a manufacturing tool.** No DFM, BOMs, fabrication output.
-- **Not real-time physics.** Simulation is *quasi-static sweeping*, not time-stepped integration.
-- **Not a general rigid-body solver.** The solver is specialized for planar linkage topologies.
+- **Not a game-physics engine.** The default workflow is still *drive a parameterized mechanism, relax to a pose, record telemetry*, not free-running real-time dynamics.
+- **Not a general rigid-body solver.** The engine is a planar Verlet + constraint-projection system tuned first for mechanisms, while leaving room for ropes, textiles, and soft bodies later.
 - **No gears, cams, springs, belts in MVP.** See §15 Future Development.
 
 ---
 
 ## 3. Core Architecture
 
-Linkage is built as **two concurrent loops** that share one primary lock-free handoff buffer plus two auxiliary lock-free slots. The Render Loop is always drawing — the screen never freezes while the LLM thinks, while mutations validate, or while a sweep is being solved. The Design Loop, running asynchronously, publishes new swept artifacts when ready; the Render Loop picks them up on the next frame.
+Linkage is built as **two concurrent loops** that share one primary lock-free handoff buffer plus two auxiliary lock-free slots. The Render Loop is always drawing — the screen never freezes while the LLM thinks, while mutations validate, or while a sweep is being relaxed. The Design Loop, running asynchronously, publishes new swept artifacts when ready; the Render Loop picks them up on the next frame.
 
 ```
                       User (NL intent)
@@ -67,6 +67,7 @@ Key properties:
 - **The shared state has one primary handoff plus two auxiliary slots.** `committed_sweep: ArcSwap<SweepArtifact>` is the main render handoff; `staged_assembly` and `activity_state` are auxiliary lock-free preview/HUD slots.
 - **Telemetry is the LLM's sensor.** Each committed artifact carries the telemetry that feeds the next prompt turn.
 - **The renderer can run interactive or headless.** The same Committed Sweep playback path is usable for on-screen inspection, CI snapshot tests, offline frame export, and other non-interactive tooling.
+- **The simulation core is Verlet-based.** Every committed frame comes from the same particle-and-constraint relaxation path that can later be extended to ropes, textiles, and soft bodies.
 
 ---
 
@@ -88,7 +89,7 @@ All spec-visible maps below use ordered maps (`BTreeMap`) rather than `HashMap`,
 
 ### 4.2 Joints
 
-A joint is a 2D point. Every joint is either **Fixed** (world-space coordinate provided by the user/LLM) or **Free** (position is a solver output).
+A joint is a 2D point. Every joint is either **Fixed** (world-space coordinate provided by the user/LLM) or **Free** (position is produced by the Verlet relaxation pass).
 
 ```rust
 struct Joint {
@@ -97,12 +98,12 @@ struct Joint {
 }
 
 enum JointKind {
-    Fixed { position: Vec2 },  // grounded anchor, solver treats as constant
-    Free,                      // position computed by the constraint solver
+    Fixed { position: Vec2 },  // grounded anchor, held constant by projection
+    Free,                      // particle integrated then projected by constraints
 }
 ```
 
-A link between two joints implies a distance constraint. A slider implies a line constraint on one of its joints. The solver places all `Free` joints consistent with those constraints plus the current drive values.
+A link between two joints implies a distance constraint. A slider implies a line constraint on one of its joints. At runtime, every `Free` joint is represented as a particle with current and previous positions; the simulation step advances particles with Verlet integration and then projects constraints until the assembly is within tolerance or the iteration budget is exhausted.
 
 ### 4.3 Parts
 
@@ -112,7 +113,7 @@ enum Part {
         id: PartId,
         a: JointId,
         b: JointId,
-        length: f32,          // canonical; joint positions must match this after solve
+        length: f32,          // canonical; joint positions must match this after relaxation
     },
     Slider {
         id: PartId,
@@ -130,7 +131,7 @@ enum Part {
 
 ### 4.4 Drives
 
-Drives are the system's *inputs*. Each drive has a **range**; the simulator **sweeps** that range to produce telemetry. Drives do not carry time — they carry a parameter `u ∈ [range.0, range.1]`.
+Drives are the system's *inputs*. Each drive has a **range**; the simulator **sweeps** that range to produce telemetry. Drives do not carry real time directly — they carry a target parameter `u ∈ [range.0, range.1]` that the relaxation engine enforces while solving each sampled pose.
 
 ```rust
 struct Drive {
@@ -142,8 +143,9 @@ struct Drive {
 enum DriveKind {
     /// Rotates a link around one of its joints. The angle is measured between
     /// (pivot → tip) and the +x axis. `tip_joint` must be Free; `pivot_joint`
-    /// is typically Fixed. The drive sets angle; the solver places tip_joint
-    /// at distance link.length from pivot at that angle, then solves the rest.
+    /// is typically Fixed. The drive contributes an angular target constraint;
+    /// the relaxation pass projects the crank toward that angle, then settles
+    /// the remaining constraints.
     Angular {
         pivot_joint: JointId,
         tip_joint:   JointId,
@@ -152,8 +154,8 @@ enum DriveKind {
     },
 
     /// Translates a joint along a slider's axis. `joint` must be the joint
-    /// referenced by `slider`. Sets the joint's position on the track; solver
-    /// places all other Free joints accordingly.
+    /// referenced by `slider`. The drive contributes a target position along
+    /// the track; the relaxation pass settles the rest of the assembly around it.
     Linear {
         slider: PartId,
         joint:  JointId,
@@ -177,6 +179,7 @@ struct Assembly {
     parts:  BTreeMap<PartId, Part>,
     drives: BTreeMap<DriveId, Drive>,
     points_of_interest: Vec<PointOfInterest>,  // points whose path the LLM should trace
+    visualization: Option<VisualizationSpec>,  // optional trace-space transforms / rendering intent
     meta:   AssemblyMeta,
 }
 
@@ -187,6 +190,21 @@ struct PointOfInterest {
     perp:  f32,      // perpendicular offset from the link, 0.0 for on-axis
 }
 
+struct VisualizationSpec {
+    trace_model: Option<TraceModel>,
+}
+
+enum TraceModel {
+    /// Render selected POI paths as if the linkage is drawing on paper that
+    /// continuously rolls in one direction while the sweep advances.
+    RollingPaper {
+        direction: PaperDirection,   // Up | Down | Left | Right in screen/world trace space
+        advance_per_cycle: f32,      // paper travel over one committed playback cycle
+    },
+}
+
+enum PaperDirection { Up, Down, Left, Right }
+
 struct AssemblyMeta {
     name:      String,
     iteration: u32,
@@ -194,13 +212,15 @@ struct AssemblyMeta {
 }
 ```
 
-`PointOfInterest` is crucial: most interesting linkage goals ("trace a straight line", "describe a figure-8") are properties of a specific point on a coupler, not a joint. POIs are defined only on `Link` parts in MVP; validation rejects any other host with `POI_HOST_INVALID`. The LLM names the point and the sweep records its trajectory.
+`PointOfInterest` is crucial: most interesting linkage goals ("trace a straight line", "describe a figure-8") are properties of a specific point on a coupler, not a joint. POIs are defined only on `Link` parts in MVP; validation rejects any other host with `POI_HOST_INVALID`. The LLM names the point and the sweep records its trajectory from the relaxed particle positions at each sample.
+
+`VisualizationSpec` is intentionally separate from the mechanism itself. It does not alter the constraint set or the relaxation pass; it alters how traced paths are interpreted and drawn. The first non-mechanical trace model is `RollingPaper`, which treats all POI paths as if the mechanism is drawing onto paper that translates steadily during the sweep. This is useful for spirograph / plotter / rolling-paper compositions without inventing extra linkage parts just to represent the paper feed.
 
 ---
 
 ## 5. Serialization Contract
 
-One consistent discriminator style across the schema: domain variants (`JointKind`, `Part`, `DriveKind`) are **internally tagged** via a `"type"` field, while mutation variants are tagged by `"op"`. This keeps both the persisted assembly and the tool-call payloads hand-authorable and LLM-friendly.
+One consistent discriminator style across the schema: domain variants (`JointKind`, `Part`, `DriveKind`, `TraceModel`) are **internally tagged** via a `"type"` field, while mutation variants are tagged by `"op"`. This keeps both the persisted assembly and the tool-call payloads hand-authorable and LLM-friendly.
 
 ```json
 {
@@ -226,6 +246,13 @@ One consistent discriminator style across the schema: domain variants (`JointKin
   "points_of_interest": [
     { "id": "p_slider_out", "host": "l_coupler", "t": 1.0, "perp": 0.0 }
   ],
+  "visualization": {
+    "trace_model": {
+      "type": "RollingPaper",
+      "direction": "Up",
+      "advance_per_cycle": 240.0
+    }
+  },
   "meta": { "name": "slider-crank", "iteration": 3, "notes": [] }
 }
 ```
@@ -326,7 +353,7 @@ When the orchestrator rejects a mutation batch it returns to the LLM, on the nex
 }
 ```
 
-Error codes are a closed enum: `JOINT_NOT_FOUND`, `PART_NOT_FOUND`, `DRIVE_NOT_FOUND`, `DUPLICATE_ID`, `LENGTH_MISMATCH`, `UNKNOWN_PATCH_KEY`, `OVER_CONSTRAINED`, `UNDER_CONSTRAINED`, `DRIVE_TARGET_INVALID`, `DRIVE_COUNT_INVALID`, `SLIDER_RANGE_INVALID`, `POI_HOST_INVALID`, `SOLVER_DIVERGED`. The LLM is prompted to reference codes in its retry reasoning.
+Error codes are a closed enum: `JOINT_NOT_FOUND`, `PART_NOT_FOUND`, `DRIVE_NOT_FOUND`, `DUPLICATE_ID`, `LENGTH_MISMATCH`, `UNKNOWN_PATCH_KEY`, `OVER_CONSTRAINED`, `UNDER_CONSTRAINED`, `DRIVE_TARGET_INVALID`, `DRIVE_COUNT_INVALID`, `SLIDER_RANGE_INVALID`, `POI_HOST_INVALID`, `RELAXATION_FAILED`. The LLM is prompted to reference codes in its retry reasoning.
 
 A mutation batch is atomic: *all* ops apply, or *none* do. On any rejection the assembly is rolled back and the batch is returned as errors.
 
@@ -335,9 +362,10 @@ A mutation batch is atomic: *all* ops apply, or *none* do. On any rejection the 
 ```
 You are Linkage, a planar linkage design assistant.
 
-You work with a 2D kinematic solver. You can create and modify assemblies of
-joints (Fixed or Free), links, sliders, and drives (Angular or Linear). Every
-drive has a range; the simulator sweeps that range and returns telemetry.
+You work with a 2D Verlet-based constraint simulator. You can create and modify
+assemblies of joints (Fixed or Free), links, sliders, and drives (Angular or
+Linear). Every drive has a range; the simulator sweeps that range and returns
+telemetry from the relaxed poses.
 
 RULES:
 - Call the `propose_mutations` tool. Do not emit JSON in prose.
@@ -346,7 +374,7 @@ RULES:
 - Ground your mechanism with at least one Fixed joint.
 - In MVP, produce at most one drive for any assembly you expect to sweep/commit.
 - Every Free joint must be reachable via a chain of links/sliders to a Fixed
-  joint, or the system is under-constrained.
+  joint, or the system is under-constrained and the relaxation pass will drift.
 - Points of interest may host only on `Link` parts, never on `Slider` parts.
 - When you receive <telemetry>, compare against the user's goal and propose
   corrective changes.
@@ -355,11 +383,11 @@ RULES:
 - If the assembly is over- or under-constrained, fix that first.
 
 VOCABULARY:
-- Joints:     Fixed (grounded), Free (solver-placed)
+- Joints:     Fixed (grounded), Free (relaxation-placed)
 - Parts:      Link, Slider
 - Drives:     Angular (rotates a link about a pivot), Linear (slides a joint on its track)
 - Telemetry:  traces, range_of_motion, degrees_of_freedom, constraint_error,
-              solver_status, point_paths
+              relaxation_status, point_paths
 
 CURRENT ASSEMBLY:
 <current_assembly>{{ASSEMBLY_JSON}}</current_assembly>
@@ -379,8 +407,8 @@ LAST REJECTIONS (may be empty):
 
 Linkage runs **two loops concurrently**, sharing a small lock-free `SharedState`. The primary handoff is the Committed Sweep buffer; auxiliary slots carry staged preview state and HUD activity state.
 
-- **Design Loop** — a tokio async task that drives one LLM turn at a time: prompt → LLM tool-call → validate → solve/sweep → publish. When a sweep completes, its artifact is `ArcSwap::store`d into the Committed Sweep slot.
-- **Render Loop** — the nannou event loop on its own thread, running at a steady 60 Hz. Every frame it `ArcSwap::load`s the Committed Sweep, advances a local phase `u ∈ [0, 1)`, samples the matching solved frame, and draws it.
+- **Design Loop** — a tokio async task that drives one LLM turn at a time: prompt → LLM tool-call → validate → relax/sweep → publish. When a sweep completes, its artifact is `ArcSwap::store`d into the Committed Sweep slot.
+- **Render Loop** — the nannou event loop on its own thread, running at a steady 60 Hz. Every frame it `ArcSwap::load`s the Committed Sweep, advances a local phase `u ∈ [0, 1)`, samples the matching relaxed frame, and draws it.
 
 The Render Loop **never awaits** anything from the Design Loop. It always has something to draw — on cold start, an empty placeholder sweep (just the grid + any seed assembly). The instant the first real sweep lands, playback begins automatically. If the LLM takes 30 seconds, the screen keeps animating the last committed sweep that whole time, and the HUD reflects what the Design Loop is doing.
 
@@ -400,9 +428,10 @@ The Render Loop **never awaits** anything from the Design Loop. It always has so
 │    Atomic; on error → rollback, publish <rejected>, GOTO 1   │
 │        │                                                     │
 │        ▼                                                     │
-│  [4. SOLVE & SWEEP]                                          │
+│  [4. RELAX & SWEEP]                                          │
 │    For the active drive, step its range across `samples`     │
-│    frames; solve constraints per sample. Build SweepArtifact.│
+│    frames; Verlet-integrate and project constraints per      │
+│    sample. Build SweepArtifact.                              │
 │        │                                                     │
 │        ▼                                                     │
 │  [5. PUBLISH]                                                │
@@ -450,13 +479,13 @@ enum ActivityState {
     Thinking   { turn: u32, elapsed_ms: u32 },          // LLM request in flight
     Staging    { ops_received: usize },                 // streaming tool-use deltas
     Validating { ops: usize },                          // applying a batch
-    Solving    { sample: u32, total: u32 },             // sweep in progress
+    Relaxing   { sample: u32, total: u32 },             // sweep in progress
     Committed  { turn: u32, shown_until_ms: u64 },      // brief "new!" flash
     Error      { code: String, message: String },      // from rejection, auto-clears
 }
 ```
 
-The HUD shows this as a small status line in a corner — a spinner while Thinking/Solving, a counter of streamed ops while Staging, a brief highlight when a new sweep is Committed. The main animation continues underneath regardless.
+The HUD shows this as a small status line in a corner — a spinner while Thinking/Relaxing, a counter of streamed ops while Staging, a brief highlight when a new sweep is Committed. The main animation continues underneath regardless.
 
 ### 7.4 Cancellation
 
@@ -479,7 +508,7 @@ When enabled, the Design Loop runs without user input. The system prompt gains a
 - `token_budget` exceeded (default 100k total across the run).
 - `wall_clock_budget` exceeded (default 5 min).
 - **Oscillation:** same assembly hash visited twice in the last 5 iterations.
-- **Solver divergence:** two consecutive sweeps return `SOLVER_DIVERGED`.
+- **Relaxation failure:** two consecutive sweeps return `RELAXATION_FAILED`.
 
 All thresholds are configurable; defaults are calibrated for a single-user interactive session and should be re-tuned before any long-running unattended use. Quantitative convergence scoring and tolerance-based stopping are future work.
 
@@ -491,29 +520,43 @@ Each applied mutation batch is a snapshot in an `im::Vector<Assembly>` history s
 
 ## 8. Simulation Engine
 
-Planar kinematic solver. Quasi-static: no time, no integration — the drive parameter `u` sweeps its range and the solver re-solves constraints at each sample.
+Planar constraint simulation built on Verlet integration plus iterative constraint projection. The default mechanism workflow is still quasi-static from the user's point of view: the drive parameter `u` sweeps its range, each sample is warm-started from the previous one, and the engine relaxes to a constrained pose before recording telemetry.
 
-### 8.1 Solver
+### 8.1 Integrator and constraints
 
-- Distance constraints (links) and point-on-line constraints (sliders) are assembled into a sparse residual vector.
-- Fixed joints and the current drive parameter are treated as constants.
-- The residual is minimized via damped Newton-Raphson with a fallback to Levenberg-Marquardt on ill-conditioned steps.
-- The solver is warm-started from the previous sweep sample; closed-form initialization is used for the first sample of sweeps where a closed form exists (e.g. pure four-bar from ground angles).
+- Every `Free` joint is a particle with `pos` and `prev_pos`. A sample begins from the previous sample's settled state, or from a deterministic seeded layout on cold start.
+- A small Verlet step advances particles before projection:
+
+```rust
+next_pos = pos + (pos - prev_pos) * damping + accel * dt * dt;
+```
+
+- MVP mechanisms use zero external acceleration by default; the important motion comes from constraint projection, not gravity or impulses.
+- Constraints are projected iteratively in Gauss-Seidel style:
+  - `FixedJoint` keeps an anchor at an exact world position.
+  - `LinkDistance` enforces `|a - b| = length`.
+  - `SliderTrack` keeps a joint on a line and inside its travel range.
+  - `AngularDriveTarget` projects a driven crank toward a target angle.
+  - `LinearDriveTarget` projects a slider joint toward a target position on its track.
+- A sample is considered settled when max correction and max constraint error both fall below tolerance before the iteration budget is exhausted.
+- The first sample of a sweep is warm-started from a deterministic seed assembly pose; subsequent samples warm-start from the previous settled sample so sweeps remain coherent and cheap.
+- This choice is intentional: the same particle-and-constraint machinery can later grow from rigid linkages into ropes, textiles, and soft bodies without replacing the simulation core.
 
 ### 8.2 Determinism
 
 The simulator is bit-reproducible across runs on the same platform. This is a hard requirement: auto-refine and regression tests both compare telemetry across iterations, and flaky baselines would poison the whole loop.
 
-- Ordered maps throughout persisted and published state (`BTreeMap`, not `HashMap`) so solver assembly, telemetry, prompts, and snapshots all traverse in a stable order.
+- Ordered maps throughout persisted and published state (`BTreeMap`, not `HashMap`) so constraint assembly, telemetry, prompts, and snapshots all traverse in a stable order.
 - No wall-clock or thread RNG.
 - Fixed sample count per sweep; no early exit.
+- Fixed iteration counts, projection ordering, and damping constants per assembly version.
 - f32 throughout; no mixed-precision fallbacks.
 
 ### 8.3 Telemetry
 
 ```rust
 struct Telemetry {
-    solver_status: SolverStatus,           // Converged | Diverged | Singular
+    relaxation_status: RelaxationStatus,   // Converged | MaxIterations | Diverged
     degrees_of_freedom: i32,
     max_constraint_error: f32,
     sample_count: u32,
@@ -560,9 +603,9 @@ struct SweepArtifact {
 
 struct SolvedFrame {
     u:               f32,                           // normalized sweep phase, 0..1
-    joint_positions: BTreeMap<JointId, Vec2>,       // every joint, solved
+    joint_positions: BTreeMap<JointId, Vec2>,       // every joint, relaxed
     drive_values:    BTreeMap<DriveId, f32>,        // angle or position per drive
-    poi_positions:   BTreeMap<String,  Vec2>,       // points of interest, solved
+    poi_positions:   BTreeMap<String,  Vec2>,       // points of interest, relaxed
 }
 ```
 
@@ -606,12 +649,12 @@ The renderer supports both the normal interactive windowed mode and a headless m
 5. **Joints** — filled circles. Fixed = square outline; Free = round.
 6. **Drive indicators** — arc arrows on Angular drives; straight double-ended arrows on Linear drives, showing range.
 7. **Ghost overlay** — semi-transparent preview from `staged_assembly`, shown before acceptance.
-8. **HUD** — iteration, solver status, DoF, token budget, current objective, LLM activity spinner.
+8. **HUD** — iteration, relaxation status, DoF, token budget, current objective, LLM activity spinner.
 
 ### 9.2 Interaction
 
 - Click joint/part → select, show properties panel.
-- Drag Free joint → hint position for next solve (solver uses as warm-start only; does not pin).
+- Drag Free joint → hint position for the next relaxation seed (warm-start only; does not pin).
 - Drag Fixed joint → move the anchor.
 - `Space` → play/pause sweep animation.
 - `R` → trigger one LLM refine iteration.
@@ -638,7 +681,7 @@ Playback time is defined over the normalized committed sweep interval, not the p
 
 If `shared.staged_assembly.load()` is `Some`, the renderer draws it as translucent ghosts on top of the current playback frame. Ghosts render at the active drive's range midpoint; staging is not swept.
 
-The HUD reads `shared.activity_state.load()` and shows the current state — `Thinking` / `Staging` / `Validating` / `Solving` / `Committed` / `Error` — without ever stalling the render.
+The HUD reads `shared.activity_state.load()` and shows the current state — `Thinking` / `Staging` / `Validating` / `Relaxing` / `Committed` / `Error` — without ever stalling the render.
 
 ---
 
@@ -669,7 +712,7 @@ Aligned with the existing `Cargo.toml` of this repo (`nannou 0.19`, `serde 1`, e
 | LLM client        | Trait + `reqwest = "0.12"` (streaming) | Provider-agnostic; swap Anthropic / OpenAI / local |
 | Async runtime     | `tokio = "1"`                        | Required by reqwest                           |
 | Shared state      | `arc-swap = "1"`                     | Lock-free publish of Committed Sweep + staged assembly + activity state |
-| Solver math       | `nalgebra` or hand-rolled sparse LA  | Small systems; no huge dep needed             |
+| Simulation math   | Hand-rolled Verlet + constraint projection | Matches MVP needs; extends to ropes / cloth / soft bodies |
 | Persistent state  | `im = "15"`                          | Cheap snapshot history                        |
 | Errors            | `thiserror = "2"` + `anyhow = "1"`   | Error taxonomy for §6.3 rejections            |
 | Observability     | `tracing = "0.1"` + `tracing-subscriber` | Loop visibility, token/latency spans       |
@@ -706,12 +749,12 @@ The tokio multi-thread runtime hosts the Design Loop async task. Nannou owns its
 
 ## 12. Testing Strategy
 
-- **Unit:** mutation apply/reject, ID resolution, patch validation. Use `insta` snapshots for telemetry of canonical assemblies.
+- **Unit:** mutation apply/reject, ID resolution, patch validation, constraint projection. Use `insta` snapshots for telemetry of canonical assemblies.
 - **Property tests (`proptest`):**
   - Mobility invariant: the validated mechanism's unactuated mobility matches the number of declared independent drives before drive values are applied.
   - Idempotence: apply → serialize → deserialize → apply-again → same state.
   - Sweep reversibility: forward sweep then reverse sweep returns matching sample sets (up to float tolerance).
-- **Golden assemblies:** a directory of hand-authored assemblies (four-bar, slider-crank, pantograph, Watt I, Roberts) with recorded telemetry. Changing the solver without changing any golden is a CI failure.
+- **Golden assemblies:** a directory of hand-authored assemblies (four-bar, slider-crank, pantograph, Watt I, Roberts) with recorded telemetry. Changing the relaxation engine or projection order without changing any golden is a CI failure.
 - **Deterministic sweep tests:** run the same assembly 100× and assert byte-identical telemetry.
 - **Headless render tests:** run the renderer without a window against golden sweep artifacts and assert stable trace output, including dotted POI path rendering.
 - **LLM integration tests:** mocked `LlmClient` that replays recorded tool-call responses; asserts the loop correctly handles validation rejections, iterative feedback, and termination.
@@ -728,12 +771,12 @@ The tokio multi-thread runtime hosts the Design Loop async task. Nannou owns its
 - [ ] Orchestrator: validate + apply mutation batches atomically
 - [ ] Error feedback protocol (§6.3) end-to-end
 - [ ] Nannou renderer: grid, joints, links, sliders, HUD (no traces yet)
-- [ ] Single-shot: user prompt → LLM → validated mutations → render (no sweep yet)
+- [ ] Single-shot: user prompt → LLM → validated mutations → relax and render (no sweep yet)
 - **Exit criterion:** user can type "make a four-bar linkage grounded at (-50,0) and (50,0)" and see it rendered, including `modify_part` corrections after an initial rejection.
 
 ### Phase 2 — Sweep + Feedback Loop
 
-- [ ] Constraint solver (distance + point-on-line) with deterministic sweeping
+- [ ] Verlet integrator + constraint projection (distance + point-on-line + drive target) with deterministic sweeping
 - [ ] Telemetry collection (§8.3)
 - [ ] Point-of-interest system + path rendering
 - [ ] Ghost overlay for staged mutations
@@ -808,11 +851,12 @@ LLM (iter 3):
 
 ## 15. Future Development
 
-Out of MVP scope; the data model, solver, and prompt vocabulary should not preclude any of these.
+Out of MVP scope; the data model, simulator, and prompt vocabulary should not preclude any of these.
 
-- **Gears, gear trains, belts, pulleys.** Meshing as a constraint coupling angular drives. Rendering as involute tooth silhouettes. Will require extending `Part`, `Constraint`, and the solver's residual. Deferred because gear meshing introduces tangency constraints and ratio coupling that complicate both the solver and the LLM prompt vocabulary; not worth the cost until the linkage loop is solid.
+- **Gears, gear trains, belts, pulleys.** Meshing as a constraint coupling angular drives. Rendering as involute tooth silhouettes. Will require extending `Part`, `Constraint`, and the projection set. Deferred because gear meshing introduces tangency constraints and ratio coupling that complicate both the simulator and the LLM prompt vocabulary; not worth the cost until the linkage loop is solid.
 - **Cams and cam-followers.** Profile-lookup constraints.
-- **Springs.** Would push the system from kinematic to dynamic; requires masses and a proper integrator.
+- **Ropes, textiles, and soft bodies.** This is the main reason the core is Verlet-based. These would arrive as additional particles plus distance / bending / area / attachment constraints rather than a second simulation architecture.
+- **Springs.** Natural to add once particles and compliance are first-class, but still deferred until the rigid-linkage loop is stable.
 - **3D linkages.** The data model keeps Vec2 explicit today; migrating to Vec3 is non-trivial but the topological graph carries over. `wgpu` via Nannou would handle the rendering.
 - **CAD export.** SVG is feasible in Phase 3. STEP / IGES requires either an external tool or a heavy Rust crate.
 - **Local LLM.** The tool-use schema is simple enough for a fine-tuned 7B model. Worth trying once the protocol stabilizes.
@@ -824,6 +868,7 @@ Out of MVP scope; the data model, solver, and prompt vocabulary should not precl
 
 ## 16. Open Questions
 
-- **Solver library vs. hand-rolled?** A tailored planar constraint solver is ~a few hundred lines and avoids pulling in a general physics engine. Start hand-rolled; revisit if performance or topology complexity demands otherwise.
+- **Constraint compliance model.** MVP can start with rigid projection and global damping. The open question is when to introduce per-constraint compliance / softness for future cloth and soft-body work.
+- **Iteration budget vs. quality.** How many projection iterations per sample are enough for stable linkage telemetry without making sweeps too expensive?
 - **POI discovery.** Should the LLM be able to ask "add a POI wherever the path looks most interesting", or does it always specify (`host`, `t`, `perp`)? Lean toward explicit for now; add a `find_interesting_poi` helper tool later if needed.
 - **Session persistence.** Out of MVP, but the JSON format is the natural save file; Phase 3 could add a simple `./sessions/` directory or similar repo-local save path.

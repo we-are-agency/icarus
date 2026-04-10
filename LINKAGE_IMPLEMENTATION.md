@@ -1,12 +1,12 @@
 # Linkage Implementation Plan
 
-This document is the initial implementation sequence for the system described in [LINKAGE.md](./LINKAGE.md). The goal is to reach a working vertical slice quickly, prove the main technical risks in order, and avoid introducing LLM/concurrency complexity before the rendering and solver path is stable.
+This document is the initial implementation sequence for the system described in [LINKAGE.md](./LINKAGE.md). The goal is to reach a working vertical slice quickly, prove the main technical risks in order, and avoid introducing LLM/concurrency complexity before the rendering and Verlet-relaxation path is stable.
 
 ---
 
 ## Principles
 
-- Start with the render loop, then add mechanism data, then playback, then LLM generation.
+- Start with the render loop, then add mechanism data, then relaxation, then playback, then LLM generation.
 - Keep the left side of the UI read-only at first. It is an inspection panel, not an editor.
 - Render the exact `serde_json::to_string_pretty(&assembly)` output on the left so the UI shows the same assembly shape the LLM and validator operate on later.
 - Prefer vertical slices over broad scaffolding.
@@ -123,30 +123,31 @@ Running the app shows a stable "hello world" style render in windowed mode, and 
 
 ---
 
-## P1 — Hard-Coded Assembly + Static Solved View
+## P1 — Hard-Coded Assembly + Static Relaxed View
 
 ### Goal
 
-Prove the first full data-to-render path using a hard-coded fixture assembly.
+Prove the first full data-to-render path using a hard-coded fixture assembly and a minimal Verlet constraint pass.
 
 ### UI
 
 - Left half: hard-coded linkage assembly displayed as exact `serde_json::to_string_pretty(&assembly)` output.
-- Right half: linkage drawn in a static solved origin-state.
+- Right half: linkage drawn in a static relaxed origin-state.
 
 ### Scope
 
 - Define the first assembly fixture in code or serde-backed data.
 - Parse/load the fixture.
 - Validate it.
-- Use a closed-form first fixture topology (slider-crank or pure four-bar) so the first solved pose does not depend on the full general NR path.
-- Solve a single static pose.
+- Introduce runtime particle state for `Free` joints (`pos`, `prev_pos`).
+- Implement the minimum constraint projection set needed for the first fixture: fixed anchor, link distance, slider track, and one drive target at a chosen sample.
+- Relax a single static pose to convergence.
 - Draw joints, links, and sliders.
 - Keep the right side static; no playback yet.
 
 ### Exit Criterion
 
-The app renders a valid hard-coded linkage from structured input, with the serialized spec visible alongside it.
+The app renders a valid hard-coded linkage from structured input via the Verlet relaxation path, with the serialized spec visible alongside it.
 
 ---
 
@@ -160,14 +161,14 @@ Make failure modes visible before LLM-generated input enters the system.
 
 - Add at least two or three fixture assemblies.
 - Add at least one intentionally invalid validator fixture (bad IDs, invalid patch target, malformed references, or equivalent).
-- Add at least one intentionally unsolved / diverging solver fixture.
+- Add at least one intentionally unrelaxable / diverging fixture.
 - Show validator failure clearly in the UI instead of crashing.
-- Show solver failure clearly in the UI instead of crashing.
-- Keep rendering responsive even when a fixture cannot solve.
+- Show relaxation failure clearly in the UI instead of crashing.
+- Keep rendering responsive even when a fixture cannot settle.
 
 ### Exit Criterion
 
-The app can switch between valid fixtures, validator-invalid fixtures, and solver-invalid fixtures, rendering the valid ones and surfacing distinct errors for the invalid ones.
+The app can switch between valid fixtures, validator-invalid fixtures, and relaxation-invalid fixtures, rendering the valid ones and surfacing distinct errors for the invalid ones.
 
 ---
 
@@ -186,7 +187,7 @@ Prove the basic sweep/playback model with one hard-coded driven assembly.
 
 - Add one active drive to a fixture assembly.
 - Introduce `SweepArtifact` + `SolvedFrame` in the implementation shape described by `LINKAGE.md` §8.4.
-- Produce solved frames for one sweep interval and store them in an `Arc<SweepArtifact>`.
+- Produce relaxed frames for one sweep interval and store them in an `Arc<SweepArtifact>`.
 - Have the renderer read from `Arc<SweepArtifact>` even though publication is still synchronous and in-process at this milestone.
 - Implement ping-pong traversal.
 - Add POIs and dotted POI trace rendering now that sweep playback exists.
@@ -194,7 +195,7 @@ Prove the basic sweep/playback model with one hard-coded driven assembly.
 
 ### Exit Criterion
 
-The right side animates a driven linkage smoothly from `Arc<SweepArtifact>`-backed solved frames, dotted POI traces render correctly, and running the same fixture sweep twice produces byte-identical frame output.
+The right side animates a driven linkage smoothly from `Arc<SweepArtifact>`-backed relaxed frames, dotted POI traces render correctly, and running the same fixture sweep twice produces byte-identical frame output.
 
 ---
 
@@ -207,7 +208,7 @@ Introduce the first LLM path without yet introducing the full async iterative de
 ### UI
 
 - Left half: assembly JSON derived from the validated current assembly.
-- Right half: rendered and animated as in P2 when validation and solving succeed.
+- Right half: rendered and animated as in P2 when validation and relaxation succeed.
 
 ### Scope
 
@@ -216,13 +217,13 @@ Introduce the first LLM path without yet introducing the full async iterative de
 - Verify the provider tool-use API shape against current docs before wiring it up.
 - Receive one `propose_mutations` result.
 - Validate it.
-- If valid, solve and render it.
+- If valid, relax and render it.
 - If invalid, display the failure clearly and keep the app alive.
 - Do not yet add staged streaming, ghost previews, or iterative feedback turns.
 
 ### Exit Criterion
 
-A one-shot startup prompt can produce a `propose_mutations` tool response that validates, solves, and renders without manual intervention.
+A one-shot startup prompt can produce a `propose_mutations` tool response that validates, relaxes, and renders without manual intervention.
 
 ---
 
@@ -318,7 +319,7 @@ Undo returns to a prior assembly state and republishes a valid sweep artifact wi
 ## Critical Path Notes
 
 - P0 fixes the binary location and renderer I/O boundary, including headless mode.
-- P1 keeps the first solver path cheap by using a closed-form fixture.
+- P1 proves the first minimal Verlet path cheaply by using one fixture and the smallest useful projection set.
 - P2 is the key architectural seam: the renderer must already consume `Arc<SweepArtifact>` here so concurrency later is additive.
 - P3a proves provider integration and tool-use shape.
 - P3b proves the rejection-feedback contract from the spec.
