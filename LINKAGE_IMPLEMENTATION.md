@@ -1,6 +1,6 @@
 # Linkage Implementation Plan
 
-This document is the initial implementation sequence for the system described in [LINKAGE.md](./LINKAGE.md). The goal is to reach a working vertical slice quickly, prove the main technical risks in order, and avoid introducing LLM/concurrency complexity before the rendering and Verlet-relaxation path is stable.
+This document is the initial implementation sequence for the system described in [LINKAGE.md](./LINKAGE.md). The goal is to reach a working vertical slice quickly, prove the main technical risks in order, and prioritize compelling motion and renderer robustness before introducing more LLM/concurrency complexity.
 
 ---
 
@@ -12,6 +12,8 @@ This document is the initial implementation sequence for the system described in
 - Prefer vertical slices over broad scaffolding.
 - Keep the right side artifact-oriented as early as possible so later `Committed Sweep` integration does not require a rewrite.
 - Defer the async Design Loop, staged ghosts, and live telemetry-driven iteration until one-shot generation is stable.
+- Optimize for interesting motion before strict mechanism correctness.
+- Treat malformed data and broken references as errors, but do not assume ambiguous or lively simulation behavior is itself a failure.
 
 ---
 
@@ -141,13 +143,13 @@ Prove the first full data-to-render path using a hard-coded fixture assembly and
 - Validate it.
 - Introduce runtime particle state for `Free` joints (`pos`, `prev_pos`).
 - Implement the minimum constraint projection set needed for the first fixture: fixed anchor, link distance, slider track, and one drive target at a chosen sample.
-- Relax a single static pose to convergence.
+- Relax a single static pose far enough to draw cleanly.
 - Draw joints, links, and sliders.
 - Keep the right side static; no playback yet.
 
 ### Exit Criterion
 
-The app renders a valid hard-coded linkage from structured input via the Verlet relaxation path, with the serialized spec visible alongside it.
+The app renders a hard-coded linkage from structured input via the Verlet relaxation path, with the serialized spec visible alongside it.
 
 ---
 
@@ -155,20 +157,21 @@ The app renders a valid hard-coded linkage from structured input via the Verlet 
 
 ### Goal
 
-Make failure modes visible before LLM-generated input enters the system.
+Make malformed-input failures and unstable-simulation outcomes visible before LLM-generated input enters the system.
 
 ### Scope
 
 - Add at least two or three fixture assemblies.
 - Add at least one intentionally invalid validator fixture (bad IDs, invalid patch target, malformed references, or equivalent).
 - Add at least one intentionally unrelaxable / diverging fixture.
+- Decide which unstable outcomes are true errors versus acceptable expressive behavior for the current mode.
 - Show validator failure clearly in the UI instead of crashing.
 - Show relaxation failure clearly in the UI instead of crashing.
 - Keep rendering responsive even when a fixture cannot settle.
 
 ### Exit Criterion
 
-The app can switch between valid fixtures, validator-invalid fixtures, and relaxation-invalid fixtures, rendering the valid ones and surfacing distinct errors for the invalid ones.
+The app can switch between valid fixtures, validator-invalid fixtures, and relaxation-invalid fixtures, rendering the drawable ones and surfacing distinct errors for the malformed or unusable ones.
 
 ---
 
@@ -191,11 +194,11 @@ Prove the basic sweep/playback model with one hard-coded driven assembly.
 - Have the renderer read from `Arc<SweepArtifact>` even though publication is still synchronous and in-process at this milestone.
 - Implement ping-pong traversal.
 - Add POIs and dotted POI trace rendering now that sweep playback exists.
-- Add a determinism check that running the same fixture sweep twice produces byte-identical frame data.
+- Add a repeatability check that running the same fixture sweep twice on the same platform produces byte-identical frame data.
 
 ### Exit Criterion
 
-The right side animates a driven linkage smoothly from `Arc<SweepArtifact>`-backed relaxed frames, dotted POI traces render correctly, and running the same fixture sweep twice produces byte-identical frame output.
+The right side animates a driven linkage smoothly from `Arc<SweepArtifact>`-backed relaxed frames, dotted POI traces render correctly, and running the same fixture sweep twice on the same platform produces byte-identical frame output.
 
 ---
 
@@ -218,7 +221,7 @@ Introduce the first LLM path without yet introducing the full async iterative de
 - Receive one `propose_mutations` result.
 - Validate it.
 - If valid, relax and render it.
-- If invalid, display the failure clearly and keep the app alive.
+- If invalid or unusable, display the problem clearly and keep the app alive.
 - Do not yet add staged streaming, ghost previews, or iterative feedback turns.
 
 ### Exit Criterion
@@ -290,7 +293,7 @@ Committed playback, staged previews, HUD activity, and phase-preserving artifact
 
 ### Goal
 
-Add the first local history mechanism after the cross-thread rendering path is stable.
+Add the first local history mechanism after the cross-thread rendering path is robust.
 
 ### Scope
 
@@ -324,4 +327,4 @@ Undo returns to a prior assembly state and republishes a valid sweep artifact wi
 - P3a proves provider integration and tool-use shape.
 - P3b proves the rejection-feedback contract from the spec.
 - P4a proves cross-thread committed artifact publication on its own.
-- P4b adds the auxiliary polish layers after the committed-sweep path is stable.
+- P4b adds the auxiliary polish layers after the committed-sweep path is robust.

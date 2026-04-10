@@ -1,4 +1,4 @@
-# Linkage: LLM-Driven Mechanical Linkage Constructor & Visualizer
+# Linkage: LLM-Driven Linkage Simulation Playground & Visualizer
 
 ## Product Requirements Document
 
@@ -8,7 +8,9 @@
 
 ## 1. Vision
 
-Linkage is an explorative mechanical design tool in which an LLM acts as co-designer. The user states intent in natural language ("a straight-line linkage", "a compact crank-slider", "a pantograph that scales 3x"), and the system iteratively constructs, simulates, sweeps, and refines planar mechanisms — rendered in real time via Nannou. The LLM does not generate once; it enters a **critique → mutate → sweep → observe → refine** loop, consuming swept telemetry and proposing incremental mutations.
+Linkage is an explorative simulation tool in which an LLM acts as co-designer. The user states intent in natural language ("a straight-line linkage", "a compact crank-slider", "something strange that jitters and blooms into spirals"), and the system iteratively constructs, simulates, sweeps, and refines planar assemblies rendered in real time via Nannou. The LLM does not generate once; it enters a **critique → mutate → sweep → observe → refine** loop, consuming telemetry and proposing incremental mutations.
+
+The aim is not to certify mechanisms. The aim is to produce compelling motion, interesting traces, and responsive visual experimentation. A branch switch, near-lockup, wobble, or snap can be a valid aesthetic result rather than an automatic failure.
 
 ---
 
@@ -17,10 +19,10 @@ Linkage is an explorative mechanical design tool in which an LLM acts as co-desi
 Scoping up front so neither the user, the LLM, nor future-me wander:
 
 - **Not a CAD tool.** No dimensioning, drafting, tolerancing, STEP export.
-- **Not a full physics sandbox.** MVP uses a Verlet-based constraint integrator to reach plausible constrained poses and traces, but it is not aiming at physically accurate forces, impacts, or material simulation yet.
+- **Not an engineering-grade physics simulator.** MVP uses a Verlet-based constraint integrator to produce compelling constrained motion and traces, but it is not aiming at physically accurate forces, impacts, or material models yet.
 - **Not a manufacturing tool.** No DFM, BOMs, fabrication output.
-- **Not a game-physics engine.** The default workflow is still *drive a parameterized mechanism, relax to a pose, record telemetry*, not free-running real-time dynamics.
-- **Not a general rigid-body solver.** The engine is a planar Verlet + constraint-projection system tuned first for mechanisms, while leaving room for ropes, textiles, and soft bodies later.
+- **Not a proof-oriented kinematics package.** The engine may settle into one branch of an ambiguous assembly, hop branches, or fail to settle cleanly, and those behaviors can still be useful visual outcomes.
+- **Not a general rigid-body solver.** The engine is a planar Verlet + constraint-projection system tuned for expressive 2D assemblies first, while leaving room for ropes, textiles, and soft bodies later.
 - **No gears, cams, springs, belts in MVP.** See §15 Future Development.
 
 ---
@@ -67,7 +69,8 @@ Key properties:
 - **The shared state has one primary handoff plus two auxiliary slots.** `committed_sweep: ArcSwap<SweepArtifact>` is the main render handoff; `staged_assembly` and `activity_state` are auxiliary lock-free preview/HUD slots.
 - **Telemetry is the LLM's sensor.** Each committed artifact carries the telemetry that feeds the next prompt turn.
 - **The renderer can run interactive or headless.** The same Committed Sweep playback path is usable for on-screen inspection, CI snapshot tests, offline frame export, and other non-interactive tooling.
-- **The simulation core is Verlet-based.** Every committed frame comes from the same particle-and-constraint relaxation path that can later be extended to ropes, textiles, and soft bodies.
+- **The simulation core is Verlet-based.** Every committed frame comes from the same particle-and-constraint path that can later be extended to ropes, textiles, and soft bodies.
+- **Repeatability matters more than uniqueness.** The runtime should replay the same input the same way on the same platform, but it does not attempt to prove a single globally-correct pose for ambiguous assemblies.
 
 ---
 
@@ -89,7 +92,7 @@ All spec-visible maps below use ordered maps (`BTreeMap`) rather than `HashMap`,
 
 ### 4.2 Joints
 
-A joint is a 2D point. Every joint is either **Fixed** (world-space coordinate provided by the user/LLM) or **Free** (position is produced by the Verlet relaxation pass).
+A joint is a 2D point. Every joint is either **Fixed** (world-space coordinate provided by the user/LLM) or **Free** (position is produced by the Verlet simulation pass).
 
 ```rust
 struct Joint {
@@ -103,7 +106,7 @@ enum JointKind {
 }
 ```
 
-A link between two joints implies a distance constraint. A slider implies a line constraint on one of its joints. At runtime, every `Free` joint is represented as a particle with current and previous positions; the simulation step advances particles with Verlet integration and then projects constraints until the assembly is within tolerance or the iteration budget is exhausted.
+A link between two joints implies a distance constraint. A slider implies a line constraint on one of its joints. At runtime, every `Free` joint is represented as a particle with current and previous positions; the simulation step advances particles with Verlet integration and then projects constraints until the assembly becomes drawable enough for the current mode or the iteration budget is exhausted.
 
 ### 4.3 Parts
 
@@ -125,13 +128,13 @@ enum Part {
 }
 ```
 
-- `Link.length` is canonical. On `add_part`, if the two joints are already placed, the orchestrator verifies `|a - b| ≈ length` within tolerance and rejects otherwise (with a specific error, see §6.3).
+- `Link.length` is the rest length the simulation tries to honor. If the two joints are already placed, the orchestrator may warn or reject depending on validation mode, but exact agreement is not the primary product goal.
 - `Slider` is a constraint and a part at once: it restricts one joint to a track and is visualized as a track.
 - There is no separate `Frame` type. Ground is represented by one or more `Fixed` joints.
 
 ### 4.4 Drives
 
-Drives are the system's *inputs*. Each drive has a **range**; the simulator **sweeps** that range to produce telemetry. Drives do not carry real time directly — they carry a target parameter `u ∈ [range.0, range.1]` that the relaxation engine enforces while solving each sampled pose.
+Drives are the system's *inputs*. Each drive has a **range**; the simulator **sweeps** or plays through that range to produce telemetry. Drives do not carry real time directly — they carry a target parameter `u ∈ [range.0, range.1]` that the simulation engine uses to steer motion across a sampled interval.
 
 ```rust
 struct Drive {
@@ -212,7 +215,7 @@ struct AssemblyMeta {
 }
 ```
 
-`PointOfInterest` is crucial: most interesting linkage goals ("trace a straight line", "describe a figure-8") are properties of a specific point on a coupler, not a joint. POIs are defined only on `Link` parts in MVP; validation rejects any other host with `POI_HOST_INVALID`. The LLM names the point and the sweep records its trajectory from the relaxed particle positions at each sample.
+`PointOfInterest` is crucial: most interesting goals ("trace a straight line", "describe a figure-8", "leave a trembling ribbon on rolling paper") are properties of a specific point on a coupler, not a joint. POIs are defined only on `Link` parts in MVP; validation rejects any other host with `POI_HOST_INVALID`. The LLM names the point and the sweep records its trajectory from the simulated particle positions at each sample.
 
 `VisualizationSpec` is intentionally separate from the mechanism itself. It does not alter the constraint set or the relaxation pass; it alters how traced paths are interpreted and drawn. The first non-mechanical trace model is `RollingPaper`, which treats all POI paths as if the mechanism is drawing onto paper that translates steadily during the sweep. This is useful for spirograph / plotter / rolling-paper compositions without inventing extra linkage parts just to represent the paper feed.
 
@@ -355,32 +358,38 @@ When the orchestrator rejects a mutation batch it returns to the LLM, on the nex
 
 Error codes are a closed enum: `JOINT_NOT_FOUND`, `PART_NOT_FOUND`, `DRIVE_NOT_FOUND`, `DUPLICATE_ID`, `LENGTH_MISMATCH`, `UNKNOWN_PATCH_KEY`, `OVER_CONSTRAINED`, `UNDER_CONSTRAINED`, `DRIVE_TARGET_INVALID`, `DRIVE_COUNT_INVALID`, `SLIDER_RANGE_INVALID`, `POI_HOST_INVALID`, `RELAXATION_FAILED`. The LLM is prompted to reference codes in its retry reasoning.
 
+Malformed references and impossible drive declarations are hard errors. By contrast, visually interesting but unstable behavior is allowed unless the current assembly or turn explicitly requests strict validation; a batch that produces branch switching, jitter, or incomplete settling may still be committed if it yields a drawable artifact and useful telemetry.
+
 A mutation batch is atomic: *all* ops apply, or *none* do. On any rejection the assembly is rolled back and the batch is returned as errors.
 
 ### 6.4 System prompt
 
 ```
-You are Linkage, a planar linkage design assistant.
+You are Linkage, a planar simulation design assistant.
 
 You work with a 2D Verlet-based constraint simulator. You can create and modify
 assemblies of joints (Fixed or Free), links, sliders, and drives (Angular or
 Linear). Every drive has a range; the simulator sweeps that range and returns
-telemetry from the relaxed poses.
+telemetry from the simulated poses.
 
 RULES:
 - Call the `propose_mutations` tool. Do not emit JSON in prose.
 - Explain your mechanical thinking in the `reasoning` field.
 - Keep mutations small and incremental: 1–5 ops per turn.
-- Ground your mechanism with at least one Fixed joint.
+- Ground your assembly with at least one Fixed joint.
 - In MVP, produce at most one drive for any assembly you expect to sweep/commit.
-- Every Free joint must be reachable via a chain of links/sliders to a Fixed
-  joint, or the system is under-constrained and the relaxation pass will drift.
+- Every Free joint should usually be reachable via a chain of links/sliders to
+  a Fixed joint, or the system will drift.
 - Points of interest may host only on `Link` parts, never on `Slider` parts.
 - When you receive <telemetry>, compare against the user's goal and propose
   corrective changes.
 - When you receive <rejected>, read the error codes and fix the specific ops
   that failed before proposing new ones.
-- If the assembly is over- or under-constrained, fix that first.
+- Prefer motion that is visually legible, surprising, or expressive over motion
+  that is merely conventional.
+- Over- or under-constrained assemblies are not automatically bad if they still
+  produce drawable and interesting motion; only fix them first when they make
+  the result unusable or when strict validation is requested.
 
 VOCABULARY:
 - Joints:     Fixed (grounded), Free (relaxation-placed)
@@ -520,31 +529,32 @@ Each applied mutation batch is a snapshot in an `im::Vector<Assembly>` history s
 
 ## 8. Simulation Engine
 
-Planar constraint simulation built on Verlet integration plus iterative constraint projection. The default mechanism workflow is still quasi-static from the user's point of view: the drive parameter `u` sweeps its range, each sample is warm-started from the previous one, and the engine relaxes to a constrained pose before recording telemetry.
+Planar constraint simulation built on Verlet integration plus iterative constraint projection. The default MVP workflow is still sampled playback from the user's point of view: the drive parameter `u` sweeps its range, each sample is warm-started from the previous one, and the engine projects toward a drawable constrained pose before recording telemetry. This is a simulation-first system, not a proof-oriented solver, so branch switches, near-lockups, and partial settling can be meaningful outcomes rather than automatic invalid states.
 
 ### 8.1 Integrator and constraints
 
-- Every `Free` joint is a particle with `pos` and `prev_pos`. A sample begins from the previous sample's settled state, or from a deterministic seeded layout on cold start.
+- Every `Free` joint is a particle with `pos` and `prev_pos`. A sample begins from the previous sample's simulated state, or from a deterministic seeded layout on cold start.
 - A small Verlet step advances particles before projection:
 
 ```rust
 next_pos = pos + (pos - prev_pos) * damping + accel * dt * dt;
 ```
 
-- MVP mechanisms use zero external acceleration by default; the important motion comes from constraint projection, not gravity or impulses.
+- MVP assemblies use zero external acceleration by default; the important motion comes from constraint projection, not gravity or impulses.
 - Constraints are projected iteratively in Gauss-Seidel style:
   - `FixedJoint` keeps an anchor at an exact world position.
   - `LinkDistance` enforces `|a - b| = length`.
   - `SliderTrack` keeps a joint on a line and inside its travel range.
   - `AngularDriveTarget` projects a driven crank toward a target angle.
   - `LinearDriveTarget` projects a slider joint toward a target position on its track.
-- A sample is considered settled when max correction and max constraint error both fall below tolerance before the iteration budget is exhausted.
-- The first sample of a sweep is warm-started from a deterministic seed assembly pose; subsequent samples warm-start from the previous settled sample so sweeps remain coherent and cheap.
+- A sample is considered converged enough for strict mode when max correction and max constraint error both fall below tolerance before the iteration budget is exhausted.
+- In normal expressive mode, the engine may still publish a sample sequence that does not fully settle, as long as the artifact is drawable and the telemetry remains meaningful.
+- The first sample of a sweep is warm-started from a deterministic seed assembly pose; subsequent samples warm-start from the previous sample so sweeps remain coherent and cheap.
 - This choice is intentional: the same particle-and-constraint machinery can later grow from rigid linkages into ropes, textiles, and soft bodies without replacing the simulation core.
 
 ### 8.2 Determinism
 
-The simulator is bit-reproducible across runs on the same platform. This is a hard requirement: auto-refine and regression tests both compare telemetry across iterations, and flaky baselines would poison the whole loop.
+The simulator should be bit-reproducible across runs on the same platform. This is a runtime repeatability requirement, not a claim that every assembly has one unique physically-correct solution. Ambiguous assemblies may have multiple plausible branches; the current state and projection order simply choose one repeatably.
 
 - Ordered maps throughout persisted and published state (`BTreeMap`, not `HashMap`) so constraint assembly, telemetry, prompts, and snapshots all traverse in a stable order.
 - No wall-clock or thread RNG.
@@ -585,7 +595,7 @@ struct DerivedObservations {
 }
 ```
 
-`DerivedObservations` is what the LLM actually reads most often — raw point paths are attached but summarized unless explicitly referenced by name. Quantitative goal scoring, tolerance bands, and metric-specific pass/fail evaluation are deferred to Future Development.
+`DerivedObservations` is what the LLM actually reads most often — raw point paths are attached but summarized unless explicitly referenced by name. Quantitative goal scoring, tolerance bands, and metric-specific pass/fail evaluation are deferred to Future Development. Over time this section should grow more vocabulary for expressive events such as snaps, stalls, wobble, branch flips, and dense trace regions.
 
 ### 8.4 Sweep artifact and publication
 
@@ -751,11 +761,11 @@ The tokio multi-thread runtime hosts the Design Loop async task. Nannou owns its
 
 - **Unit:** mutation apply/reject, ID resolution, patch validation, constraint projection. Use `insta` snapshots for telemetry of canonical assemblies.
 - **Property tests (`proptest`):**
-  - Mobility invariant: the validated mechanism's unactuated mobility matches the number of declared independent drives before drive values are applied.
   - Idempotence: apply → serialize → deserialize → apply-again → same state.
-  - Sweep reversibility: forward sweep then reverse sweep returns matching sample sets (up to float tolerance).
-- **Golden assemblies:** a directory of hand-authored assemblies (four-bar, slider-crank, pantograph, Watt I, Roberts) with recorded telemetry. Changing the relaxation engine or projection order without changing any golden is a CI failure.
-- **Deterministic sweep tests:** run the same assembly 100× and assert byte-identical telemetry.
+  - Direction semantics: `Forward`, `Reverse`, and `PingPong` traverse the published interval as specified.
+  - Repeatability: same assembly + same constants + same platform returns the same sampled artifact.
+- **Golden assemblies:** a directory of hand-authored assemblies (four-bar, slider-crank, pantograph, Watt I, Roberts, plus a few intentionally ambiguous toys) with recorded telemetry. Changing the simulation engine or projection order without changing any golden is a CI failure.
+- **Repeatable sweep tests:** run the same assembly 100× and assert byte-identical telemetry on the same platform.
 - **Headless render tests:** run the renderer without a window against golden sweep artifacts and assert stable trace output, including dotted POI path rendering.
 - **LLM integration tests:** mocked `LlmClient` that replays recorded tool-call responses; asserts the loop correctly handles validation rejections, iterative feedback, and termination.
 
@@ -776,13 +786,13 @@ The tokio multi-thread runtime hosts the Design Loop async task. Nannou owns its
 
 ### Phase 2 — Sweep + Feedback Loop
 
-- [ ] Verlet integrator + constraint projection (distance + point-on-line + drive target) with deterministic sweeping
+- [ ] Verlet integrator + constraint projection (distance + point-on-line + drive target) with repeatable sweeping
 - [ ] Telemetry collection (§8.3)
 - [ ] Point-of-interest system + path rendering
 - [ ] Ghost overlay for staged mutations
 - [ ] Full loop: prompt → mutate → sweep → render → feedback
 - [ ] Undo/redo via `im` history
-- **Exit criterion:** user can describe a desired motion, watch the mechanism update over several telemetry-guided iterations, and see the latest committed sweep animate without blocking.
+- **Exit criterion:** user can describe a desired motion or vibe, watch the assembly update over several telemetry-guided iterations, and see the latest committed sweep animate without blocking.
 
 ### Phase 3 — Exploration
 
@@ -856,7 +866,7 @@ Out of MVP scope; the data model, simulator, and prompt vocabulary should not pr
 - **Gears, gear trains, belts, pulleys.** Meshing as a constraint coupling angular drives. Rendering as involute tooth silhouettes. Will require extending `Part`, `Constraint`, and the projection set. Deferred because gear meshing introduces tangency constraints and ratio coupling that complicate both the simulator and the LLM prompt vocabulary; not worth the cost until the linkage loop is solid.
 - **Cams and cam-followers.** Profile-lookup constraints.
 - **Ropes, textiles, and soft bodies.** This is the main reason the core is Verlet-based. These would arrive as additional particles plus distance / bending / area / attachment constraints rather than a second simulation architecture.
-- **Springs.** Natural to add once particles and compliance are first-class, but still deferred until the rigid-linkage loop is stable.
+- **Springs.** Natural to add once particles and compliance are first-class, but still deferred until the expressive rigid-linkage loop is stable.
 - **3D linkages.** The data model keeps Vec2 explicit today; migrating to Vec3 is non-trivial but the topological graph carries over. `wgpu` via Nannou would handle the rendering.
 - **CAD export.** SVG is feasible in Phase 3. STEP / IGES requires either an external tool or a heavy Rust crate.
 - **Local LLM.** The tool-use schema is simple enough for a fine-tuned 7B model. Worth trying once the protocol stabilizes.
@@ -869,6 +879,6 @@ Out of MVP scope; the data model, simulator, and prompt vocabulary should not pr
 ## 16. Open Questions
 
 - **Constraint compliance model.** MVP can start with rigid projection and global damping. The open question is when to introduce per-constraint compliance / softness for future cloth and soft-body work.
-- **Iteration budget vs. quality.** How many projection iterations per sample are enough for stable linkage telemetry without making sweeps too expensive?
+- **Iteration budget vs. quality.** How many projection iterations per sample are enough for compelling telemetry without making sweeps too expensive?
 - **POI discovery.** Should the LLM be able to ask "add a POI wherever the path looks most interesting", or does it always specify (`host`, `t`, `perp`)? Lean toward explicit for now; add a `find_interesting_poi` helper tool later if needed.
 - **Session persistence.** Out of MVP, but the JSON format is the natural save file; Phase 3 could add a simple `./sessions/` directory or similar repo-local save path.
