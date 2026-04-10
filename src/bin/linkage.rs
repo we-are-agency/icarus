@@ -22,7 +22,6 @@ const MAX_TRACE_CYCLE_ENTITIES: usize = 256;
 const RELAXATION_ITERATIONS: usize = 96;
 const RELAXATION_TOLERANCE: f32 = 0.001;
 const RELAXATION_DAMPING: f32 = 0.98;
-const RELAXATION_DT: f32 = 1.0;
 const RELAXATION_DIVERGENCE_LIMIT: f32 = 10_000.0;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -257,7 +256,18 @@ enum DriveKindSpec {
 #[derive(Clone, Deserialize, Serialize)]
 struct SweepSpec {
     samples: u32,
-    direction: String,
+    direction: SweepDirectionSpec,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+enum SweepDirectionSpec {
+    Forward,
+    Reverse,
+    PingPong,
+    #[serde(alias = "CW")]
+    Clockwise,
+    #[serde(alias = "CCW")]
+    CounterClockwise,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -803,7 +813,7 @@ fn slider_crank_fixture() -> AssemblySpec {
             },
             sweep: SweepSpec {
                 samples: 180,
-                direction: "Clockwise".to_string(),
+                direction: SweepDirectionSpec::Clockwise,
             },
         },
     );
@@ -919,13 +929,10 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
                         return Err(format!("drive {drive_id}: invalid angular range"));
                     }
                 }
-                if !matches!(
-                    drive.sweep.direction.as_str(),
-                    "Clockwise" | "CW" | "Forward" | "CounterClockwise" | "CCW" | "Reverse"
-                ) {
+                if range.is_none() && matches!(drive.sweep.direction, SweepDirectionSpec::PingPong)
+                {
                     return Err(format!(
-                        "drive {drive_id}: unsupported angular direction {}",
-                        drive.sweep.direction
+                        "drive {drive_id}: full-rotation angular drives require Clockwise, CounterClockwise, Forward, or Reverse"
                     ));
                 }
             }
@@ -1203,7 +1210,10 @@ fn propose_mutations_tool_schema() -> serde_json::Value {
                           "additionalProperties": false,
                           "properties": {
                             "samples": { "type": "integer", "minimum": 2 },
-                            "direction": { "type": "string" }
+                            "direction": {
+                              "type": "string",
+                              "enum": ["Forward", "Reverse", "PingPong", "Clockwise", "CounterClockwise", "CW", "CCW"]
+                            }
                           },
                           "required": ["samples", "direction"]
                         }
@@ -1585,14 +1595,13 @@ fn deterministic_seed_direction(a: &str, b: &str) -> Vec2 {
 }
 
 fn verlet_step(particles: &mut BTreeMap<String, ParticleState>) {
-    let accel = vec2(0.0, 0.0) * RELAXATION_DT * RELAXATION_DT;
     for particle in particles.values_mut() {
         if particle.fixed {
             continue;
         }
         let current = particle.pos;
         let velocity = (particle.pos - particle.prev_pos) * RELAXATION_DAMPING;
-        particle.pos += velocity + accel;
+        particle.pos += velocity;
         particle.prev_pos = current;
     }
 }
@@ -1632,6 +1641,9 @@ fn relax_particles(
         max_constraint_error =
             compute_max_constraint_error(assembly, &particles, links, sliders, drive_constraint);
         if max_constraint_error <= RELAXATION_TOLERANCE && max_correction <= RELAXATION_TOLERANCE {
+            for particle in particles.values_mut() {
+                particle.prev_pos = particle.pos;
+            }
             return Ok(RelaxationResult {
                 particles,
                 max_constraint_error,
@@ -1715,6 +1727,10 @@ fn project_slider_constraints(
         let particle = particles
             .get_mut(&slider.joint_id)
             .expect("slider joint should exist");
+        debug_assert!(
+            !particle.fixed,
+            "slider projection should not target a fixed joint"
+        );
         let rel = particle.pos - slider.axis_origin;
         let scalar = rel.dot(slider.axis_dir);
         let clamped = scalar.clamp(slider.range.0, slider.range.1);
@@ -1731,15 +1747,15 @@ fn project_link_constraints(
 ) -> f32 {
     let mut max_correction = 0.0;
     for link in links {
-        let a_particle = particles
+        let (a_pos, a_fixed) = particles
             .get(&link.a)
-            .expect("link endpoint should exist")
-            .clone();
-        let b_particle = particles
+            .map(|particle| (particle.pos, particle.fixed))
+            .expect("link endpoint should exist");
+        let (b_pos, b_fixed) = particles
             .get(&link.b)
-            .expect("link endpoint should exist")
-            .clone();
-        let delta = b_particle.pos - a_particle.pos;
+            .map(|particle| (particle.pos, particle.fixed))
+            .expect("link endpoint should exist");
+        let delta = b_pos - a_pos;
         let distance = delta.length();
         let dir = if distance > 0.000_1 {
             delta / distance
@@ -1749,7 +1765,7 @@ fn project_link_constraints(
         let error = distance - link.length;
         let correction = dir * error;
 
-        match (a_particle.fixed, b_particle.fixed) {
+        match (a_fixed, b_fixed) {
             (false, false) => {
                 if let Some(a) = particles.get_mut(&link.a) {
                     a.pos += correction * 0.5;
@@ -1957,21 +1973,26 @@ fn drive_plan(
 ) -> Result<DrivePlan, String> {
     match &drive.kind {
         DriveKindSpec::Angular { range, .. } => {
-            let direction = drive.sweep.direction.as_str();
             let (start_value, end_value, playback) = match range {
-                Some([start, end]) => {
-                    if matches!(direction, "CounterClockwise" | "CCW" | "Reverse") {
-                        (*end, *start, PlaybackTraversal::PingPong)
-                    } else {
+                Some([start, end]) => match drive.sweep.direction {
+                    SweepDirectionSpec::Forward => (*start, *end, PlaybackTraversal::Forward),
+                    SweepDirectionSpec::Reverse => (*end, *start, PlaybackTraversal::Forward),
+                    SweepDirectionSpec::PingPong => (*start, *end, PlaybackTraversal::PingPong),
+                    SweepDirectionSpec::Clockwise => (*end, *start, PlaybackTraversal::PingPong),
+                    SweepDirectionSpec::CounterClockwise => {
                         (*start, *end, PlaybackTraversal::PingPong)
                     }
-                }
-                None => match direction {
-                    "CounterClockwise" | "CCW" => (0.0, TAU, PlaybackTraversal::Forward),
-                    "Clockwise" | "CW" | "Forward" => (TAU, 0.0, PlaybackTraversal::Forward),
-                    other => {
+                },
+                None => match drive.sweep.direction {
+                    SweepDirectionSpec::Clockwise | SweepDirectionSpec::Forward => {
+                        (TAU, 0.0, PlaybackTraversal::Forward)
+                    }
+                    SweepDirectionSpec::CounterClockwise | SweepDirectionSpec::Reverse => {
+                        (0.0, TAU, PlaybackTraversal::Forward)
+                    }
+                    SweepDirectionSpec::PingPong => {
                         return Err(format!(
-                            "drive {drive_id}: unsupported angular direction {other}"
+                            "drive {drive_id}: full-rotation angular drives do not support PingPong without an explicit range"
                         ));
                     }
                 },
@@ -1993,22 +2014,32 @@ fn drive_plan(
             else {
                 return Err(format!("drive {drive_id}: missing slider part {slider}"));
             };
-            let [start_value, end_value] = range.unwrap_or(*slider_range);
+            let [range_start, range_end] = range.unwrap_or(*slider_range);
+            let (start_value, end_value, playback) = match drive.sweep.direction {
+                SweepDirectionSpec::Forward | SweepDirectionSpec::CounterClockwise => {
+                    (range_start, range_end, PlaybackTraversal::Forward)
+                }
+                SweepDirectionSpec::Reverse | SweepDirectionSpec::Clockwise => {
+                    (range_end, range_start, PlaybackTraversal::Forward)
+                }
+                SweepDirectionSpec::PingPong => {
+                    (range_start, range_end, PlaybackTraversal::PingPong)
+                }
+            };
             Ok(DrivePlan {
                 drive_id: drive_id.to_string(),
                 parameter: DriveParameter::SliderPosition,
                 start_value,
                 end_value,
                 cycle_seconds: 1.5,
-                playback: PlaybackTraversal::PingPong,
+                playback,
             })
         }
     }
 }
 
 fn sample_drive_value(plan: &DrivePlan, u: f32) -> f32 {
-    let t = playback_sample_u(u, plan.playback);
-    plan.start_value + (plan.end_value - plan.start_value) * t
+    plan.start_value + (plan.end_value - plan.start_value) * u
 }
 
 fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
@@ -2409,6 +2440,7 @@ where
 fn playback_sample_u(phase: f32, traversal: PlaybackTraversal) -> f32 {
     match traversal {
         PlaybackTraversal::Forward => phase,
+        // User-facing ping-pong is eased at the turnarounds on purpose.
         PlaybackTraversal::PingPong => 0.5 - 0.5 * (phase * TAU).cos(),
     }
 }
@@ -2880,7 +2912,7 @@ mod tests {
     }
 
     #[test]
-    fn interval_drive_ping_pong_eases_at_the_turnarounds() {
+    fn interval_drive_ping_pong_plays_one_eased_out_and_back_per_cycle() {
         let mut assembly = slider_crank_fixture();
         if let Some(DriveSpec {
             kind: DriveKindSpec::Angular { range, .. },
@@ -2895,11 +2927,25 @@ mod tests {
         let (drive_id, drive) = assembly.drives.iter().next().expect("drive");
         let plan = drive_plan(&assembly, drive_id, drive).expect("drive plan");
         assert!(matches!(plan.playback, PlaybackTraversal::PingPong));
-        assert_eq!(sample_drive_value(&plan, 0.0).to_bits(), 0.25f32.to_bits());
-        assert!((sample_drive_value(&plan, 0.5) - 1.25).abs() < 0.000_1);
+        assert_eq!(sample_drive_value(&plan, 0.0).to_bits(), 1.25f32.to_bits());
+        assert!((sample_drive_value(&plan, 0.5) - 0.75).abs() < 0.000_1);
         assert!((sample_drive_value(&plan, 1.0) - 0.25).abs() < 0.000_1);
-        let early = sample_drive_value(&plan, 0.05) - 0.25;
-        let middle = sample_drive_value(&plan, 0.30) - sample_drive_value(&plan, 0.25);
+
+        let artifact = build_sweep_artifact(assembly, 1).expect("artifact");
+        let q1 = sampled_frame(&artifact, playback_sample_u(0.25, artifact.playback));
+        let q2 = sampled_frame(&artifact, playback_sample_u(0.50, artifact.playback));
+        let q3 = sampled_frame(&artifact, playback_sample_u(0.75, artifact.playback));
+        let q4 = sampled_frame(&artifact, playback_sample_u(1.00, artifact.playback));
+        let drive_value = |frame: &SolvedFrame| *frame.drive_values.values().next().expect("drive");
+
+        assert!((drive_value(q1) - 0.75).abs() < 0.02);
+        assert!((drive_value(q2) - 0.25).abs() < 0.02);
+        assert!((drive_value(q3) - 0.75).abs() < 0.02);
+        assert!((drive_value(q4) - 1.25).abs() < 0.02);
+
+        let early = playback_sample_u(0.05, artifact.playback);
+        let middle =
+            playback_sample_u(0.30, artifact.playback) - playback_sample_u(0.25, artifact.playback);
         assert!(early < middle);
     }
 
@@ -2915,7 +2961,7 @@ mod tests {
                 },
                 sweep: SweepSpec {
                     samples: 48,
-                    direction: "Forward".to_string(),
+                    direction: SweepDirectionSpec::PingPong,
                 },
             },
         );
@@ -2928,6 +2974,26 @@ mod tests {
         assert_eq!(plan.start_value.to_bits(), (-20.0f32).to_bits());
         assert_eq!(plan.end_value.to_bits(), 180.0f32.to_bits());
         assert_eq!(plan.cycle_seconds.to_bits(), 1.5f32.to_bits());
+    }
+
+    #[test]
+    fn relaxation_warm_start_clears_residual_velocity() {
+        let assembly = slider_crank_fixture();
+        let (drive_id, drive) = assembly.drives.iter().next().expect("drive");
+        let plan = drive_plan(&assembly, drive_id, drive).expect("drive plan");
+        let links = collect_link_constraints(&assembly).expect("links");
+        let sliders = collect_slider_constraints(&assembly).expect("sliders");
+        let drive_constraint =
+            build_drive_constraint(&assembly, &plan, sample_drive_value(&plan, 0.33))
+                .expect("constraint");
+        let seeded = seed_particles(&assembly, &links, &sliders, &drive_constraint).expect("seed");
+        let relaxed = relax_particles(&assembly, &seeded, &links, &sliders, &drive_constraint)
+            .expect("relaxed");
+
+        for particle in relaxed.particles.values() {
+            assert_eq!(particle.pos.x.to_bits(), particle.prev_pos.x.to_bits());
+            assert_eq!(particle.pos.y.to_bits(), particle.prev_pos.y.to_bits());
+        }
     }
 
     #[test]
