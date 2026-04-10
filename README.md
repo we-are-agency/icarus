@@ -137,10 +137,13 @@ Useful commands:
 
 ```bash
 cargo run
+cargo run --bin primitive_atlas
 cargo run --bin eval_transcription --
 cargo run --bin eval_transcription -- --json out/report.json
 cargo test
 ```
+
+In the atlas window, use the left and right arrow keys to cycle through the primitive reference, transform lesson, the shader hello-world screen, the shader-native companion screens, and the procedural visual gallery screens.
 
 ## Repo Map
 
@@ -151,6 +154,7 @@ Top-level pieces you will usually care about:
 - [`src/transcription.rs`](./src/transcription.rs): online transcription and evaluation
 - [`src/midi_layer.rs`](./src/midi_layer.rs): note-history and visualization bridge
 - [`src/main.rs`](./src/main.rs): Nannou visualizer app
+- [`src/bin/primitive_atlas.rs`](./src/bin/primitive_atlas.rs): standalone Nannou primitive atlas
 - [`src/bin/eval_transcription.rs`](./src/bin/eval_transcription.rs): evaluation CLI
 - [`midi`](./midi): paired `.wav` / `.mid` fixtures used by the evaluator
 - [`PLANNING.md`](./PLANNING.md): working notes / plans
