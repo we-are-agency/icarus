@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, OnceLock};
 
@@ -25,6 +25,7 @@ const RELAXATION_DAMPING: f32 = 0.98;
 const RELAXATION_DIVERGENCE_LIMIT: f32 = 10_000.0;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
+static STARTUP_VARIATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -38,7 +39,6 @@ struct Model {
     capture_path: Option<PathBuf>,
     fixtures: Vec<FixturePresentation>,
     selected_fixture: usize,
-    playback_phase: f32,
     playback_progress: f32,
     playback_paused: bool,
     live_trace_cycle: u32,
@@ -417,6 +417,7 @@ fn model(app: &App) -> Model {
         .size(WINDOW_W, WINDOW_H)
         .view(view)
         .key_pressed(key_pressed)
+        .mouse_pressed(mouse_pressed)
         .mouse_wheel(mouse_wheel);
     if config.headless {
         app.set_loop_mode(LoopMode::rate_fps(60.0));
@@ -429,7 +430,6 @@ fn model(app: &App) -> Model {
         capture_path: config.capture_path,
         selected_fixture: config.fixture_index.min(fixtures.len().saturating_sub(1)),
         fixtures,
-        playback_phase: 0.0,
         playback_progress: 0.0,
         playback_paused: false,
         live_trace_cycle: 0,
@@ -470,23 +470,20 @@ fn update(app: &App, model: &mut Model, update: Update) {
         })
     {
         if model.active_artifact_turn != Some(turn) {
-            model.playback_progress = if reset_phase {
-                0.0
-            } else {
-                model.playback_progress.fract()
-            };
-            model.playback_phase = model.playback_progress;
-            model.live_trace_cycle = 0;
-            model.live_trace_u = 0.0;
+            if reset_phase {
+                model.playback_progress = 0.0;
+            }
+            let completed_cycles = model.playback_progress.floor().max(0.0) as u32;
+            model.live_trace_cycle = completed_cycles;
+            model.live_trace_u = playback_sample_u(model.playback_progress, playback);
             model.active_artifact_turn = Some(turn);
             model.trace_cycle_entities.clear();
-            model.emitted_trace_cycles = 0;
+            model.emitted_trace_cycles = completed_cycles;
         }
 
         if !model.playback_paused {
             let delta = update.since_last.as_secs_f32() / cycle_seconds.max(0.001);
             model.playback_progress += delta;
-            model.playback_phase = model.playback_progress.rem_euclid(1.0);
         }
 
         (model.live_trace_cycle, model.live_trace_u) = update_live_trace_state(
@@ -529,7 +526,6 @@ fn update(app: &App, model: &mut Model, update: Update) {
     } else {
         model.active_artifact_turn = None;
         model.playback_progress = 0.0;
-        model.playback_phase = 0.0;
         model.live_trace_cycle = 0;
         model.live_trace_u = 0.0;
         model.trace_cycle_entities.clear();
@@ -564,6 +560,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 .unwrap_or_else(|| PathBuf::from("target/linkage-windowed-capture.png"));
             app.main_window().capture_frame(path);
         }
+        Key::R => trigger_startup_generation(model),
         Key::Space => model.playback_paused = !model.playback_paused,
         Key::Tab => select_fixture(model, (model.selected_fixture + 1) % model.fixtures.len()),
         Key::Up => scroll_spec(model, app.window_rect(), -PANE_LINE_H * 3.0),
@@ -586,6 +583,18 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
     }
 }
 
+fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
+    if button != MouseButton::Left {
+        return;
+    }
+    if startup_generation_in_progress(model) {
+        return;
+    }
+    if startup_regenerate_rect(app.window_rect()).contains(app.mouse.position()) {
+        trigger_startup_generation(model);
+    }
+}
+
 fn fixture_key_index(key: Key) -> Option<usize> {
     match key {
         Key::Key1 => Some(0),
@@ -598,6 +607,30 @@ fn fixture_key_index(key: Key) -> Option<usize> {
         Key::Key8 => Some(7),
         Key::Key9 => Some(8),
         _ => None,
+    }
+}
+
+fn startup_generation_in_progress(model: &Model) -> bool {
+    model.startup_generation_rx.is_some()
+        || matches!(
+            model.fixtures.first().map(|fixture| &fixture.status),
+            Some(FixtureStatus::Loading(_))
+        )
+}
+
+fn trigger_startup_generation(model: &mut Model) {
+    if startup_generation_in_progress(model) {
+        return;
+    }
+    let previous_fixture_json = model
+        .fixtures
+        .first()
+        .map(|fixture| fixture.json_lines.join("\n"));
+    let (fixture, rx) = startup_fixture_slot(previous_fixture_json);
+    if !model.fixtures.is_empty() {
+        model.fixtures[0] = fixture;
+        model.startup_generation_rx = rx;
+        select_fixture(model, 0);
     }
 }
 
@@ -682,7 +715,7 @@ fn build_fixture_presentations() -> Result<
     ),
     String,
 > {
-    let (startup_fixture, startup_generation_rx) = startup_fixture_slot();
+    let (startup_fixture, startup_generation_rx) = startup_fixture_slot(None);
     let fixtures = vec![
         startup_fixture,
         build_fixture_presentation("2 STRICT", slider_crank_fixture())?,
@@ -716,16 +749,23 @@ fn build_fixture_presentation(
     })
 }
 
-fn startup_fixture_slot() -> (
+fn startup_fixture_slot(
+    previous_fixture_json: Option<String>,
+) -> (
     FixturePresentation,
     Option<Receiver<StartupGenerationResult>>,
 ) {
     let model_name = startup_model_name();
+    let request_id = STARTUP_VARIATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let (variant_label, variant_brief) = startup_prompt_variant(request_id);
     let placeholder_json = vec![
         "{".to_string(),
         format!("  \"startup_generation\": \"pending\","),
         format!("  \"model\": \"{}\",", model_name),
-        "  \"source\": \"static startup prompt with embedded sample fixture\"".to_string(),
+        format!("  \"variant\": \"{}\",", variant_label),
+        format!("  \"request_id\": {},", request_id),
+        "  \"source\": \"startup prompt with embedded sample fixture and novelty steering\""
+            .to_string(),
         "}".to_string(),
     ];
 
@@ -750,7 +790,13 @@ fn startup_fixture_slot() -> (
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let fixture = match generate_startup_fixture(&api_key) {
+        let fixture = match generate_startup_fixture(
+            &api_key,
+            request_id,
+            variant_label,
+            variant_brief,
+            previous_fixture_json.as_deref(),
+        ) {
             Ok(assembly) => match build_fixture_presentation("1 STARTUP", assembly) {
                 Ok(presentation) => presentation,
                 Err(err) => generation_error_fixture("1 STARTUP", err),
@@ -785,6 +831,27 @@ fn generation_error_fixture(label: &str, error: String) -> FixturePresentation {
         label: label.to_string(),
         status: FixtureStatus::GenerationError(error),
         json_lines,
+    }
+}
+
+fn startup_prompt_variant(request_id: u64) -> (&'static str, &'static str) {
+    match request_id % 4 {
+        0 => (
+            "branchy",
+            "Favor a branchy or ambiguous assembly with a surprising fold, brace, or side path.",
+        ),
+        1 => (
+            "chainy",
+            "Favor a longer internal chain with extra articulated joints or an indirect transmission path.",
+        ),
+        2 => (
+            "rolling-paper",
+            "Favor multiple POIs and a composition that leaves especially rich rolling-paper traces.",
+        ),
+        _ => (
+            "near-lock",
+            "Favor a pose family that comes close to locking, stalling, or snapping while staying drawable.",
+        ),
     }
 }
 
@@ -1096,9 +1163,26 @@ fn validate_fixture(assembly: &AssemblySpec) -> Result<(), String> {
     Ok(())
 }
 
-fn generate_startup_fixture(api_key: &str) -> Result<AssemblySpec, String> {
+fn generate_startup_fixture(
+    api_key: &str,
+    request_id: u64,
+    variant_label: &str,
+    variant_brief: &str,
+    previous_fixture_json: Option<&str>,
+) -> Result<AssemblySpec, String> {
     let sample_fixture = serde_json::to_string_pretty(&startup_prompt_sample_fixture())
         .map_err(|err| format!("failed to serialize sample fixture: {err}"))?;
+    let novelty_clause = previous_fixture_json
+        .map(|previous| {
+            format!(
+                "Previous startup fixture to differ from materially:\n{}\nProduce a startup fixture that is clearly different in topology, proportions, POI layout, or overall motion character.\nDo not make a near-copy with only tiny dimension edits.\n",
+                previous
+            )
+        })
+        .unwrap_or_else(|| {
+            "There is no previous startup fixture yet, so establish a strong visual identity.\n"
+                .to_string()
+        });
     let system_prompt = format!(
         concat!(
             "You generate one visually interesting linkage fixture for a startup visualization.\n",
@@ -1106,20 +1190,25 @@ fn generate_startup_fixture(api_key: &str) -> Result<AssemblySpec, String> {
             "Call the propose_mutations tool exactly once. Do not emit JSON in prose.\n",
             "Use add_* mutations to construct the full startup fixture in one batch.\n",
             "For this cold start, 6-12 ops is acceptable.\n",
-            "Constraints:\n",
+            "Variation token: request-{} / mode-{}.\n",
+            "Creative bias for this request: {}\n",
+            "Guidance:\n",
+            "- Include one slider track; the current renderer expects a slider-based assembly.\n",
             "- Keep the slider axis horizontal and its range increasing.\n",
-            "- Use one angular drive.\n",
-            "- If the angular drive omits range, it must stay relaxable through a full rotation.\n",
-            "- Include 1 to 3 points_of_interest on links so traces are interesting.\n",
+            "- Use exactly one drive. Angular or Linear are both acceptable; angular usually reads more clearly.\n",
+            "- If an angular drive omits range, prefer assemblies that stay drawable through a full rotation.\n",
+            "- Include 1 to 4 points_of_interest on links so traces are interesting.\n",
             "- Keep points_of_interest on their host links with perp = 0.0 by default.\n",
             "- Use perp != 0.0 only when the offset is materially important to the intended visual effect.\n",
-            "- Keep values finite and realistic for a small mechanism.\n",
+            "- Branchy, ambiguous, or slightly unstable motion is acceptable if the result stays drawable and visually interesting.\n",
+            "- Keep values finite and visually legible for a small mechanism.\n",
             "- Prefer an off-axis pivot so the crank is visibly above or below the slider track.\n",
             "- Prefer small, coherent dimensions over extreme ranges.\n",
+            "{}",
             "Here is a valid sample fixture for reference. Do not copy its exact dimensions:\n",
             "{}"
         ),
-        sample_fixture
+        request_id, variant_label, variant_brief, novelty_clause, sample_fixture
     );
 
     let request_body = serde_json::json!({
@@ -2202,11 +2291,6 @@ fn simulation_mode_label(mode: SimulationModeSpec) -> &'static str {
 
 fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
     let fixture = current_fixture(model);
-    let render_phase = if model.headless {
-        1.0
-    } else {
-        model.playback_phase
-    };
     let render_progress = if model.headless {
         1.0
     } else {
@@ -2221,6 +2305,7 @@ fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
         draw,
         win,
         model.headless,
+        startup_generation_in_progress(model),
         &model.fixtures,
         model.selected_fixture,
     );
@@ -2230,7 +2315,6 @@ fn draw_scene(draw: &Draw, win: Rect, model: &Model) {
         draw,
         render_rect,
         fixture,
-        render_phase,
         render_progress,
         live_trace_u,
         model.playback_paused,
@@ -2242,6 +2326,7 @@ fn draw_menu_layer(
     draw: &Draw,
     win: Rect,
     headless: bool,
+    startup_generating: bool,
     fixtures: &[FixturePresentation],
     selected_fixture: usize,
 ) {
@@ -2266,6 +2351,28 @@ fn draw_menu_layer(
         .font_size(9)
         .color(rgba(1.0, 1.0, 1.0, 0.68));
 
+    let regenerate_rect = startup_regenerate_rect(win);
+    draw.rect()
+        .x_y(regenerate_rect.x(), regenerate_rect.y())
+        .w_h(regenerate_rect.w(), regenerate_rect.h())
+        .color(if startup_generating {
+            rgba(1.0, 1.0, 1.0, 0.08)
+        } else {
+            rgba(1.0, 1.0, 1.0, 0.14)
+        });
+    draw.text(if startup_generating {
+        "GENERATING"
+    } else {
+        "REGENERATE"
+    })
+    .x_y(regenerate_rect.x(), regenerate_rect.y() + 1.0)
+    .font_size(8)
+    .color(if startup_generating {
+        rgba(1.0, 1.0, 1.0, 0.38)
+    } else {
+        rgba(1.0, 1.0, 1.0, 0.78)
+    });
+
     let start_x = win.left() + 220.0;
     let step = 94.0;
     let indicator_y = win.top() - 36.0;
@@ -2288,6 +2395,10 @@ fn draw_menu_layer(
                 .weight(2.0);
         }
     }
+}
+
+fn startup_regenerate_rect(win: Rect) -> Rect {
+    Rect::from_xy_wh(pt2(win.right() - 208.0, win.top() - 24.0), vec2(92.0, 22.0))
 }
 
 fn draw_spec_pane(draw: &Draw, rect: Rect, fixture: &FixturePresentation, scroll_px: f32) {
@@ -2352,7 +2463,6 @@ fn draw_render_pane(
     draw: &Draw,
     rect: Rect,
     fixture: &FixturePresentation,
-    playback_phase: f32,
     playback_progress: f32,
     live_trace_u: f32,
     playback_paused: bool,
@@ -2411,7 +2521,7 @@ fn draw_render_pane(
         }
         FixtureStatus::Solved(artifact) => {
             draw_grid_local(&local_draw, local_rect);
-            let sampled_u = playback_sample_u(playback_phase, artifact.playback);
+            let sampled_u = playback_sample_u(playback_progress, artifact.playback);
             let frame = sampled_frame(artifact, sampled_u);
             let solved = solved_assembly_for_frame(&artifact.assembly, frame);
             let bounds = artifact_bounds(artifact);
@@ -2445,8 +2555,9 @@ fn draw_render_pane(
                 })
                 .unwrap_or_else(|| "drive n/a".to_string());
             let status = format!(
-                "{}  |  u {:.2}  |  {drive_status}  |  err {:.2}",
+                "{}  |  t {:.2}  |  u {:.2}  |  {drive_status}  |  err {:.2}",
                 simulation_mode_label(artifact.assembly.meta.simulation_mode),
+                playback_progress,
                 frame.u,
                 artifact.telemetry.peak_constraint_error
             );
@@ -2614,7 +2725,8 @@ where
         .color(rgba(1.0, 1.0, 1.0, 0.92));
 }
 
-fn playback_sample_u(phase: f32, traversal: PlaybackTraversal) -> f32 {
+fn playback_sample_u(progress: f32, traversal: PlaybackTraversal) -> f32 {
+    let phase = progress.rem_euclid(1.0);
     match traversal {
         PlaybackTraversal::Forward => phase,
         // User-facing ping-pong is eased at the turnarounds on purpose.
