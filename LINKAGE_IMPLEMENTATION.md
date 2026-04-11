@@ -216,9 +216,9 @@ Introduce the first LLM path without yet introducing the full async iterative de
 ### Scope
 
 - On startup, send one fixed prompt to the LLM.
-- Use the actual `propose_mutations` tool-use contract from `LINKAGE.md` §6.1 from day one; do not introduce an ad hoc JSON-only temporary shape.
+- Use the actual `set_assembly` tool-use contract from `LINKAGE.md` §6.1 from day one; do not introduce an ad hoc JSON-only temporary shape. (Earlier drafts referenced `propose_mutations` with atomic mutation ops; the implementation switched to whole-assembly tool-use — see `LINKAGE.md` §6.1.1 for the rationale.)
 - Verify the provider tool-use API shape against current docs before wiring it up.
-- Receive one `propose_mutations` result.
+- Receive one `set_assembly` result (complete candidate `AssemblySpec`).
 - Validate it.
 - If valid, relax and render it.
 - If invalid or unusable, display the problem clearly and keep the app alive.
@@ -226,7 +226,7 @@ Introduce the first LLM path without yet introducing the full async iterative de
 
 ### Exit Criterion
 
-A one-shot startup prompt can produce a `propose_mutations` tool response that validates, relaxes, and renders without manual intervention.
+A one-shot startup prompt can produce a `set_assembly` tool response that validates, relaxes, and renders without manual intervention.
 
 ---
 
@@ -238,13 +238,13 @@ Exercise the `rejected` feedback channel before concurrency lands.
 
 ### Scope
 
-- When validation rejects a mutation batch, feed the structured rejection payload back into the next LLM turn using the `LINKAGE.md` §6.3 shape.
+- When validation rejects a submitted assembly, feed the structured rejection payload back into the next LLM turn using the `LINKAGE.md` §6.3 shape. The unchanged current assembly is included so the model can copy-edit-retry.
 - Retry within the same startup session up to a small fixed attempt count.
 - Keep the renderer alive and the latest valid artifact visible throughout retry attempts.
 
 ### Exit Criterion
 
-The app can recover from at least one initial rejected mutation batch and reach a valid rendered assembly via the structured rejection-feedback loop. This is the earliest milestone that satisfies the spec's current Phase 1 rejection-correction requirement.
+The app can recover from at least one initial rejected candidate assembly and reach a valid rendered assembly via the structured rejection-feedback loop. This is the earliest milestone that satisfies the spec's current Phase 1 rejection-correction requirement.
 
 ---
 

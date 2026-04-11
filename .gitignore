@@ -2,3 +2,5 @@
 Cargo.lock
 .fastembed_cache/
 .env
+linkage.log
+poi.json

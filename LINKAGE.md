@@ -8,7 +8,7 @@
 
 ## 1. Vision
 
-Linkage is an explorative simulation tool in which an LLM acts as co-designer. The user states intent in natural language ("a straight-line linkage", "a compact crank-slider", "something strange that jitters and blooms into spirals"), and the system iteratively constructs, simulates, sweeps, and refines planar assemblies rendered in real time via Nannou. The LLM does not generate once; it enters a **critique → mutate → sweep → observe → refine** loop, consuming telemetry and proposing incremental mutations.
+Linkage is an explorative simulation tool in which an LLM acts as co-designer. The user states intent in natural language ("a straight-line linkage", "a compact crank-slider", "something strange that jitters and blooms into spirals"), and the system iteratively constructs, simulates, sweeps, and refines planar assemblies rendered in real time via Nannou. The LLM does not generate once; it enters a **critique → revise → sweep → observe → refine** loop, consuming telemetry and resubmitting a new candidate assembly each turn via `set_assembly`.
 
 The aim is not to certify mechanisms. The aim is to produce compelling motion, interesting traces, and responsive visual experimentation. A branch switch, near-lockup, wobble, or snap can be a valid aesthetic result rather than an automatic failure.
 
@@ -29,7 +29,7 @@ Scoping up front so neither the user, the LLM, nor future-me wander:
 
 ## 3. Core Architecture
 
-Linkage is built as **two concurrent loops** that share one primary lock-free handoff buffer plus two auxiliary lock-free slots. The Render Loop is always drawing — the screen never freezes while the LLM thinks, while mutations validate, or while a sweep is being relaxed. The Design Loop, running asynchronously, publishes new swept artifacts when ready; the Render Loop picks them up on the next frame.
+Linkage is built as **two concurrent loops** that share one primary lock-free handoff buffer plus two auxiliary lock-free slots. The Render Loop is always drawing — the screen never freezes while the LLM thinks, while a submitted assembly validates, or while a sweep is being relaxed. The Design Loop, running asynchronously, publishes new swept artifacts when ready; the Render Loop picks them up on the next frame.
 
 ```
                       User (NL intent)
@@ -57,7 +57,7 @@ Linkage is built as **two concurrent loops** that share one primary lock-free ha
     │                                                 │
     │  • Plays back the latest Committed Sweep        │
     │  • Phase u cycles and is preserved across swaps │
-    │  • Ghost overlays for staged mutations          │
+    │  • Ghost overlays for staged assemblies         │
     │  • Interaction always active (pan/zoom/POI)     │
     │  • HUD reflects Design Loop ActivityState       │
     └─────────────────────────────────────────────────┘
@@ -223,7 +223,7 @@ struct AssemblyMeta {
 
 ## 5. Serialization Contract
 
-One consistent discriminator style across the schema: domain variants (`JointKind`, `Part`, `DriveKind`, `TraceModel`) are **internally tagged** via a `"type"` field, while mutation variants are tagged by `"op"`. This keeps both the persisted assembly and the tool-call payloads hand-authorable and LLM-friendly.
+One consistent discriminator style across the schema: domain variants (`JointKind`, `Part`, `DriveKind`, `TraceModel`) are **internally tagged** via a `"type"` field. This keeps both the persisted assembly and the tool-call payloads hand-authorable and LLM-friendly. The complete `AssemblySpec` is what the LLM reads from the prompt and writes back via `set_assembly` — there is no separate mutation language.
 
 ```json
 {
@@ -260,39 +260,17 @@ One consistent discriminator style across the schema: domain variants (`JointKin
 }
 ```
 
-Mutations are a list of atomic ops, internally tagged the same way:
+**Edit protocol: `set_assembly`, not atomic mutations.** Earlier drafts of this spec described a per-turn list of atomic ops (`add_joint`, `modify_part`, `remove_drive`, …). The implementation replaced that with a single `set_assembly` tool that takes the complete next assembly; see §6.1 for the contract and §6.2 for the reasoning. The assembly JSON shape above is *exactly* what the LLM reads from the prompt and writes back via `set_assembly.assembly` — there is no separate patch language.
 
-```json
-{
-  "mutations": [
-    { "op": "add_joint",      "id": "j_tip",    "joint":  { "type": "Free" } },
-    { "op": "modify_joint",   "id": "j_pivot",  "patch":  { "position": [10.0, 0.0] } },
-    { "op": "remove_joint",   "id": "j_orphan" },
-
-    { "op": "add_part",       "id": "l_crank",  "part":   { "type": "Link", "a": "j_pivot", "b": "j_tip", "length": 40.0 } },
-    { "op": "modify_part",    "id": "l_crank",  "patch":  { "length": 42.0 } },
-    { "op": "remove_part",    "id": "l_crank" },
-
-    { "op": "add_drive",      "id": "d_crank",  "drive":  { "kind": { "type": "Angular", "..." : "..." }, "sweep": { "samples": 360, "direction": "Forward" } } },
-    { "op": "remove_drive",   "id": "d_crank" },
-
-    { "op": "add_poi",        "poi":    { "id": "p_out", "host": "l_coupler", "t": 0.5, "perp": 0.0 } },
-    { "op": "remove_poi",     "id": "p_out" },
-
-    { "op": "note", "text": "Increased crank length to broaden the slider motion." }
-  ]
-}
-```
-
-`modify_*` ops use shallow `patch` objects — only the listed fields change. Patches are type-checked against the target part's schema; unknown keys are rejected (see §6.3).
+Nullable fields (`visualization`, `visualization.trace_model`, angular drive `range`, linear drive `range`) are serialized as explicit `null` rather than omitted, so the model can copy the current-assembly JSON and round-trip it through the strict tool schema without having to synthesize missing keys.
 
 ---
 
 ## 6. LLM Integration
 
-### 6.1 Transport: tool-use, not XML scraping
+### 6.1 Transport: whole-assembly tool-use, not mutation batches
 
-Linkage talks to the LLM via the provider's **structured tool-use API** (Anthropic Messages `tools`, OpenAI `tools` / structured outputs). The LLM never has to emit raw JSON inside prose; it calls `propose_mutations`, and the orchestrator receives already-validated arguments. This eliminates an entire class of parse failures.
+Linkage talks to the LLM via the provider's **structured tool-use API** (OpenAI `tools` / structured outputs with strict JSON schema; the abstraction supports Anthropic Messages `tools` as well). The LLM never has to emit raw JSON inside prose; it calls `set_assembly` and the orchestrator receives already-validated arguments. This eliminates an entire class of parse failures.
 
 ```rust
 /// Provider-agnostic abstraction so we can swap Anthropic / OpenAI / local.
@@ -310,24 +288,30 @@ One concrete tool:
 
 ```jsonc
 {
-  "name": "propose_mutations",
-  "description": "Propose 1-5 atomic mutations to the current assembly. Prefer small incremental changes.",
+  "name": "set_assembly",
+  "description": "Submit the complete next assembly. Copy the current assembly shown in the prompt, modify only what the user asks for, and return the full result. Use reasoning for turn-local explanation; put durable notes in assembly.meta.notes.",
   "input_schema": {
     "type": "object",
     "properties": {
-      "reasoning":  { "type": "string", "description": "Mechanical thinking behind this change." },
-      "mutations":  { "type": "array", "items": { "$ref": "#/defs/Mutation" }, "minItems": 1, "maxItems": 5 },
-      "variants":   { "type": "array", "description": "Optional alternative mutation sets.",
-                      "items": { "type": "array", "items": { "$ref": "#/defs/Mutation" } } }
+      "reasoning": { "type": "string", "description": "Turn-local mechanical thinking behind this change." },
+      "assembly":  { "$ref": "#/defs/AssemblySpec", "description": "The complete next assembly." }
     },
-    "required": ["reasoning", "mutations"]
+    "required": ["reasoning", "assembly"]
   }
 }
 ```
 
-Streaming tool-use deltas are applied to a *staging* assembly, so the renderer can show ghosts as the LLM writes.
+`assembly` is the full `AssemblySpec` from §4/§5; the schema is strict (`additionalProperties: false`, all nullable fields listed in `required` as explicit `null`). Durable annotations that should persist across turns go in `assembly.meta.notes`, which replaces the old `note` op. A turn that returns the assembly unchanged is valid and is the idiomatic way to answer a question or summarize state without altering the mechanism.
 
-> **Implementation note:** before wiring this up, verify the exact Anthropic Messages tool-use shape against current docs via context7 — the field names and streaming event formats have shifted across versions.
+### 6.1.1 Why whole-assembly instead of atomic mutations
+
+The original design used a `propose_mutations` tool with an `anyOf` array of 12 atomic op variants (`add_joint`, `modify_joint`, `add_part`, …, `note`) under OpenAI strict mode. In practice the model repeatedly fumbled on:
+
+1. **Id namespace collisions** — reusing the same id for both `add_part.id` and an `add_joint.id` referenced by the part's endpoints, then looping between "missing joint X" and "id collision: X is already used by part" errors.
+2. **Forgetting `add_joint`** — referencing new joint names inside `add_part.b` without adding them in the same batch.
+3. **Stacking parallel duplicate links** between the only two existing joints as a substitute for creating new ones, producing only circular POI traces.
+
+Root cause: the mutation language forced the model to track a diff against the current assembly in its head while composing a heterogeneous batch under an `anyOf + strict` schema. Every error response already showed the complete current assembly as pretty JSON in exactly the shape `AssemblySpec` serializes to — so asking the model to emit that same shape directly eliminates the translation layer. The `set_assembly` contract makes id collisions between sections structurally impossible, removes the "did I add_joint yet?" failure mode, and collapses ~500 lines of mutation-dispatch code.
 
 ### 6.2 Context management
 
@@ -339,28 +323,32 @@ Streaming tool-use deltas are applied to a *staging* assembly, so the renderer c
 
 ### 6.3 Error feedback protocol
 
-When the orchestrator rejects a mutation batch it returns to the LLM, on the next turn, a structured error:
+When the orchestrator rejects a submitted assembly it returns to the LLM, on the next turn, a structured error. The unchanged current assembly is included so the model can copy-edit-retry:
 
 ```json
 {
-  "rejected": [
-    { "op_index": 2,
-      "code": "JOINT_NOT_FOUND",
-      "message": "modify_part l_crank: joint 'j_missing' does not exist",
-      "hint":    "Did you mean 'j_pivot'?" },
-    { "op_index": 4,
-      "code": "LENGTH_MISMATCH",
-      "message": "Link l_coupler length 120.0 does not match |a−b|=98.4 within tolerance 0.1",
-      "hint":    "Either modify the joint positions or adjust length." }
-  ]
+  "ok": false,
+  "code": "VALIDATION_FAILED",
+  "assembly_unchanged": true,
+  "message": "validation failed: part l_leg: missing joint j_knee",
+  "guidance": "The submitted assembly was rejected. Resubmit set_assembly with the corrected assembly. The current assembly (unchanged) is shown below — modify it and return the full result. A link or slider references a joint that does not exist in assembly.joints. Add the joint to assembly.joints or change the reference.",
+  "error_details": {
+    "category": "missing_reference",
+    "owner_kind": "part",
+    "owner_id": "l_leg",
+    "missing_kind": "joint",
+    "missing_id": "j_knee",
+    "suggested_fix": "Add \"j_knee\" to assembly.joints (e.g. {\"type\":\"Free\"} or {\"type\":\"Fixed\",\"position\":[x,y]}), or change the reference in part l_leg to an existing joint."
+  },
+  "current_assembly": "...pretty-printed AssemblySpec..."
 }
 ```
 
-Error codes are a closed enum: `JOINT_NOT_FOUND`, `PART_NOT_FOUND`, `DRIVE_NOT_FOUND`, `DUPLICATE_ID`, `LENGTH_MISMATCH`, `UNKNOWN_PATCH_KEY`, `OVER_CONSTRAINED`, `UNDER_CONSTRAINED`, `DRIVE_TARGET_INVALID`, `DRIVE_COUNT_INVALID`, `SLIDER_RANGE_INVALID`, `POI_HOST_INVALID`, `RELAXATION_FAILED`. The LLM is prompted to reference codes in its retry reasoning.
+`error_details.category` is a closed enum: `id_collision`, `missing_reference`, `drive_count`. Relaxation and validation failures that fall outside those categories still surface via `message` + `guidance` without a structured `error_details` block.
 
-Malformed references and impossible drive declarations are hard errors. By contrast, visually interesting but unstable behavior is allowed unless the current assembly or turn explicitly requests strict validation; a batch that produces branch switching, jitter, or incomplete settling may still be committed if it yields a drawable artifact and useful telemetry.
+A submitted assembly is all-or-nothing: the orchestrator runs `validate_fixture` then relaxes and sweeps the candidate. On any failure the old assembly is preserved unchanged, the candidate is discarded, and the structured error is fed to the next turn.
 
-A mutation batch is atomic: *all* ops apply, or *none* do. On any rejection the assembly is rolled back and the batch is returned as errors.
+Malformed references and impossible drive declarations are hard errors. By contrast, visually interesting but unstable behavior is allowed unless the current assembly or turn explicitly requests strict validation; a candidate that produces branch switching, jitter, or incomplete settling may still be committed if it yields a drawable artifact and useful telemetry.
 
 ### 6.4 System prompt
 
@@ -373,18 +361,19 @@ Linear). Every drive has a range; the simulator sweeps that range and returns
 telemetry from the simulated poses.
 
 RULES:
-- Call the `propose_mutations` tool. Do not emit JSON in prose.
-- Explain your mechanical thinking in the `reasoning` field.
-- Keep mutations small and incremental: 1–5 ops per turn.
+- Call the `set_assembly` tool. Return the next complete assembly. Do not emit JSON in prose.
+- Copy <current_assembly> as your starting point; modify only what the user asks for; return the full result.
+- Explain your turn-local thinking in `reasoning`. Durable annotations that should persist across turns go in `assembly.meta.notes`.
+- Returning the assembly unchanged is valid when the user asks a question or wants a summary.
+- Nullable fields (`visualization`, `visualization.trace_model`, angular drive `range`, linear drive `range`) must be serialized as explicit `null`, not omitted — copy the exact shape shown in <current_assembly>.
 - Ground your assembly with at least one Fixed joint.
-- In MVP, produce at most one drive for any assembly you expect to sweep/commit.
+- Produce exactly one drive for any assembly you expect to sweep/commit.
 - Every Free joint should usually be reachable via a chain of links/sliders to
   a Fixed joint, or the system will drift.
 - Points of interest may host only on `Link` parts, never on `Slider` parts.
 - When you receive <telemetry>, compare against the user's goal and propose
   corrective changes.
-- When you receive <rejected>, read the error codes and fix the specific ops
-  that failed before proposing new ones.
+- When the orchestrator rejects your assembly, read `error_details.suggested_fix` and resubmit a corrected full assembly against the unchanged current assembly.
 - Prefer motion that is visually legible, surprising, or expressive over motion
   that is merely conventional.
 - Over- or under-constrained assemblies are not automatically bad if they still
@@ -405,8 +394,10 @@ LAST SWEEP TELEMETRY:
 <telemetry>{{TELEMETRY_JSON}}</telemetry>
 
 LAST REJECTIONS (may be empty):
-<rejected>{{REJECTIONS_JSON}}</rejected>
+<rejected>{{REJECTIONS_JSON}}</rejected>   <!-- error_details payload from §6.3 -->
 ```
+
+Note: earlier drafts of this prompt instructed the model to use `propose_mutations`; the implementation switched to `set_assembly` (§6.1). Any local snapshot of this prompt that still references `propose_mutations` is out of date.
 
 ---
 
@@ -429,7 +420,7 @@ The Render Loop **never awaits** anything from the Design Loop. It always has so
 │    system + <current_assembly> + <telemetry> + <rejected>    │
 │        │                                                     │
 │        ▼                                                     │
-│  [2. LLM tool-call: propose_mutations]                       │
+│  [2. LLM tool-call: set_assembly]                            │
 │    Streaming deltas → StagedAssembly (renderer shows ghosts) │
 │        │                                                     │
 │        ▼                                                     │
@@ -523,7 +514,7 @@ All thresholds are configurable; defaults are calibrated for a single-user inter
 
 ### 7.7 Undo / history
 
-Each applied mutation batch is a snapshot in an `im::Vector<Assembly>` history stack. Undo is O(1): pop the stack, re-run the sweep on the prior assembly, publish the artifact. Storage is cheap thanks to structural sharing. Undo does *not* interrupt the Render Loop — the screen continues playing the current sweep until the re-swept prior assembly commits, at which point the animation transitions with phase preserved.
+Each committed assembly is a snapshot in an `im::Vector<Assembly>` history stack. Undo is O(1): pop the stack, re-run the sweep on the prior assembly, publish the artifact. Storage is cheap thanks to structural sharing. Undo does *not* interrupt the Render Loop — the screen continues playing the current sweep until the re-swept prior assembly commits, at which point the animation transitions with phase preserved.
 
 ---
 
@@ -670,7 +661,7 @@ The renderer supports both the normal interactive windowed mode and a headless m
 - `R` → trigger one LLM refine iteration.
 - `A` → toggle auto-refine.
 - `V` → cycle LLM-proposed variants.
-- `U` / `Ctrl+Z` → undo last mutation batch.
+- `U` / `Ctrl+Z` → undo last committed assembly.
 - `Ctrl+Shift+Z` / `Ctrl+Y` → redo.
 - `Ctrl+S` → export assembly JSON.
 - `P` → pin a new POI under the cursor (snaps to nearest link).
@@ -697,7 +688,7 @@ The HUD reads `shared.activity_state.load()` and shows the current state — `Th
 
 ## 10. Exploration Modes
 
-Selected via a system-prompt modifier; all modes talk to the same `propose_mutations` tool.
+Selected via a system-prompt modifier; all modes talk to the same `set_assembly` tool.
 
 | Mode          | Prompt modifier                                              | Behavior                             |
 |---------------|--------------------------------------------------------------|--------------------------------------|
@@ -759,7 +750,7 @@ The tokio multi-thread runtime hosts the Design Loop async task. Nannou owns its
 
 ## 12. Testing Strategy
 
-- **Unit:** mutation apply/reject, ID resolution, patch validation, constraint projection. Use `insta` snapshots for telemetry of canonical assemblies.
+- **Unit:** assembly validation (missing references, id collisions, drive count, finite numeric fields), ID resolution, constraint projection. Use `insta` snapshots for telemetry of canonical assemblies.
 - **Property tests (`proptest`):**
   - Idempotence: apply → serialize → deserialize → apply-again → same state.
   - Direction semantics: `Forward`, `Reverse`, and `PingPong` traverse the published interval as specified.
@@ -778,19 +769,19 @@ The tokio multi-thread runtime hosts the Design Loop async task. Nannou owns its
 - [ ] Data model: joints (Fixed/Free), links, sliders, angular + linear drives, POIs
 - [ ] JSON (de)serialization with internally-tagged schema
 - [ ] LLM client trait + Anthropic implementation using tool-use
-- [ ] Orchestrator: validate + apply mutation batches atomically
+- [ ] Orchestrator: accept a full candidate assembly, validate and relax atomically, swap on success
 - [ ] Error feedback protocol (§6.3) end-to-end
 - [ ] Nannou renderer: grid, joints, links, sliders, HUD (no traces yet)
-- [ ] Single-shot: user prompt → LLM → validated mutations → relax and render (no sweep yet)
-- **Exit criterion:** user can type "make a four-bar linkage grounded at (-50,0) and (50,0)" and see it rendered, including `modify_part` corrections after an initial rejection.
+- [ ] Single-shot: user prompt → LLM `set_assembly` call → validated candidate assembly → relax and render (no sweep yet)
+- **Exit criterion:** user can type "make a four-bar linkage grounded at (-50,0) and (50,0)" and see it rendered, including a corrected resubmission after an initial rejection.
 
 ### Phase 2 — Sweep + Feedback Loop
 
 - [ ] Verlet integrator + constraint projection (distance + point-on-line + drive target) with repeatable sweeping
 - [ ] Telemetry collection (§8.3)
 - [ ] Point-of-interest system + path rendering
-- [ ] Ghost overlay for staged mutations
-- [ ] Full loop: prompt → mutate → sweep → render → feedback
+- [ ] Ghost overlay for staged candidate assemblies
+- [ ] Full loop: prompt → set_assembly → validate → relax → sweep → render → feedback
 - [ ] Undo/redo via `im` history
 - **Exit criterion:** user can describe a desired motion or vibe, watch the assembly update over several telemetry-guided iterations, and see the latest committed sweep animate without blocking.
 
@@ -811,48 +802,55 @@ A slider-crank — the simplest mechanism that exercises links, a slider, a Free
 ```
 User: "Create a compact slider-crank with a clear horizontal slider motion."
 
-LLM (iter 1), tool call propose_mutations:
+LLM (iter 1), tool call set_assembly:
   reasoning: "A slider-crank converts crank rotation to slider translation.
     Starting with a simple grounded crank, a longer coupler, and a horizontal
     slider track should produce readable motion and leave room to refine."
-  mutations: [
-    { "op": "add_joint", "id": "j_pivot", "joint": { "type": "Fixed", "position": [0,0] } },
-    { "op": "add_joint", "id": "j_tip",   "joint": { "type": "Free" } },
-    { "op": "add_joint", "id": "j_slide", "joint": { "type": "Free" } },
-    { "op": "add_part",  "id": "l_crank",
-      "part": { "type": "Link", "a": "j_pivot", "b": "j_tip", "length": 50 } },
-    { "op": "add_part",  "id": "l_coupler",
-      "part": { "type": "Link", "a": "j_tip", "b": "j_slide", "length": 150 } },
-    { "op": "add_part",  "id": "s_track",
-      "part": { "type": "Slider", "joint": "j_slide",
-                "axis_origin": [0,0], "axis_dir": [1,0], "range": [-250,250] } },
-    { "op": "add_drive", "id": "d_crank",
-      "drive": { "kind": { "type": "Angular", "pivot_joint": "j_pivot",
-                           "tip_joint": "j_tip", "link": "l_crank",
-                           "range": [0, 6.283185] },
-                 "sweep": { "samples": 360, "direction": "Forward" } } },
-    { "op": "add_poi", "poi": { "id": "p_out", "host": "l_coupler", "t": 1.0, "perp": 0 } }
-  ]
+  assembly: {
+    "joints": {
+      "j_pivot": { "type": "Fixed", "position": [0, 0] },
+      "j_tip":   { "type": "Free" },
+      "j_slide": { "type": "Free" }
+    },
+    "parts": {
+      "l_crank":   { "type": "Link", "a": "j_pivot", "b": "j_tip",   "length": 50 },
+      "l_coupler": { "type": "Link", "a": "j_tip",   "b": "j_slide", "length": 150 },
+      "s_track":   { "type": "Slider", "joint": "j_slide",
+                     "axis_origin": [0, 0], "axis_dir": [1, 0], "range": [-250, 250] }
+    },
+    "drives": {
+      "d_crank": {
+        "kind": { "type": "Angular", "pivot_joint": "j_pivot",
+                  "tip_joint": "j_tip", "link": "l_crank",
+                  "range": [0, 6.283185] },
+        "sweep": { "samples": 360, "direction": "Forward" }
+      }
+    },
+    "points_of_interest": [
+      { "id": "p_out", "host": "l_coupler", "t": 1.0, "perp": 0 }
+    ],
+    "visualization": null,
+    "meta": { "name": "slider-crank", "iteration": 1, "notes": [] }
+  }
 
-[Orchestrator applies atomically. Sweep runs.]
+[Orchestrator validates the candidate, relaxes it, and swaps it in on success.
+ Sweep runs.]
 [Telemetry: the slider motion is readable and horizontal, the coupler path is clean, no self-intersection.]
 
 LLM (iter 2), reading telemetry, refines for clarity:
   reasoning: "The motion works, but the coupler can be cleaned up and the
-    slider travel can be made more visually legible."
-  mutations: [
-    { "op": "modify_part", "id": "l_coupler", "patch": { "length": 170 } },
-    { "op": "note", "text": "Lengthened the coupler to smooth the visible motion." }
-  ]
+    slider travel can be made more visually legible. Lengthening the coupler
+    to 170 should smooth the visible motion."
+  assembly: { ... same as iter 1 but parts.l_coupler.length = 170,
+              meta.iteration = 2,
+              meta.notes appended with "Lengthened the coupler to smooth the visible motion." }
 
 User: "Make the slider travel feel broader."
 
 LLM (iter 3):
   reasoning: "Broadening the visible sweep is easiest by increasing the crank
     radius while keeping the rest of the layout stable."
-  mutations: [
-    { "op": "modify_part", "id": "l_crank", "patch": { "length": 60 } }
-  ]
+  assembly: { ... same as iter 2 but parts.l_crank.length = 60, meta.iteration = 3 }
 
 [Sweep: the slider path spans a wider horizontal range and remains stable.]
 ```
