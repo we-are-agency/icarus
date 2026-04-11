@@ -2371,11 +2371,17 @@ fn llm_prompt_reference_fixture() -> AssemblySpec {
 }
 
 fn set_assembly_tool_schema() -> serde_json::Value {
+    // NOTE: strict mode is intentionally OFF. OpenAI strict mode requires every
+    // object to enumerate its properties and forbids open-object maps with
+    // `additionalProperties: <schema>`. The assembly's joints/parts/drives are
+    // BTreeMap<String, _> with unknown keys, so the natural JSON shape is
+    // inherently a map. The retry loop in generate_llm_turn handles schema
+    // drift via tool_call_error_output + correction attempts, so the strict
+    // guarantee is not needed here.
     serde_json::json!({
         "type": "function",
         "name": "set_assembly",
         "description": "Submit the complete next assembly. Copy the current assembly shown in the prompt, modify only what the user asks for, and return the full result. Use reasoning for turn-local explanation; put durable notes in assembly.meta.notes.",
-        "strict": true,
         "parameters": {
             "type": "object",
             "additionalProperties": false,
